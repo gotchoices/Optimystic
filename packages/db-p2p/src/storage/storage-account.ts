@@ -3,6 +3,7 @@ import type { IPieceStore } from '../blob/piece-store.js';
 import type { BlobHoldKind } from '../blob/blob-record.js';
 import type { IRawStorage } from './i-raw-storage.js';
 import type { NodeStorage } from './node-storage.js';
+import type { StoragePressureThresholds } from './storage-pressure.js';
 import { blockStoreCountsPieces } from './store-coverage.js';
 import { createLogger } from '../logger.js';
 
@@ -22,6 +23,19 @@ export interface StorageAllotmentOptions {
 	 * integer above 0 throws at node construction rather than being clamped.
 	 */
 	bytes?: number;
+
+	/**
+	 * The fractions of the effective total at which this node changes what it does — `reclaimBelow`
+	 * (0.40), `shedAbove` (0.85) and `refuseAbove` (0.95) by default. Each must be a finite number
+	 * strictly between 0 and 1 and they must be in that order, or node construction throws
+	 * (`resolveStoragePressureThresholds`).
+	 *
+	 * Here, with the allotment they are fractions OF, rather than under `arachnode`: they are about
+	 * this machine's disk, and a client node has an allotment and an account exactly as a serving node
+	 * does. {@link StorageAccount} itself does not read them — it measures, and `StoragePressure`
+	 * (`packages/db-p2p/src/storage/storage-pressure.ts`) is what reads the measurement against them.
+	 */
+	thresholds?: Partial<StoragePressureThresholds>;
 
 	/**
 	 * Lifetime (ms) of the memoized scan. Default {@link DEFAULT_USED_BYTES_CACHE_TTL_MS} (60_000);
@@ -149,10 +163,12 @@ export interface StorageBreakdown {
  * an allotment below 2 GiB — a host smaller than the phone the default was written for. Every larger
  * allotment keeps the host's own figure, so no existing deployment's cache shrinks.
  *
- * And an eighth cannot move a ring on its own. The outward transition fires above 85 % use
- * (`RingSelectorConfig.thresholds.moveOut`), and 12.5 % of the allotment spent on blobs nobody asked
- * the node to keep cannot reach it. A share large enough to approach that threshold would have the
- * node shedding responsibility to protect a read cache, which inverts what the two are for.
+ * And an eighth cannot move a ring on its own. The outward transition fires above the default 85 %
+ * use (`storageAllotment.thresholds.shedAbove`, which feeds `RingSelectorConfig.thresholds.moveOut`),
+ * and 12.5 % of the allotment spent on blobs nobody asked the node to keep cannot reach it. A share
+ * large enough to approach that threshold would have the node shedding responsibility to protect a
+ * read cache, which inverts what the two are for. An operator who lowers `shedAbove` below an eighth
+ * has said the node should shed that early, and the argument is theirs to make.
  */
 export const CACHE_ALLOTMENT_SHARE = 1 / 8;
 

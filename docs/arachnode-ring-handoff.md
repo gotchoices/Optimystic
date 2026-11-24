@@ -90,12 +90,15 @@ Let `R` be the node's **currently-advertised** ring. Do not move to `R±1` unles
 depth is solidly past the boundary by a dead-band `h` (≈ 0.5 ring):
 
 - Move **out** (`R → R+1`) only when `d ≥ R + 1 − h` **and** `usedPercent > moveOut` (the
-  existing 0.85 threshold).
-- Move **in** (`R → R-1`) only when `d ≤ R − 1 + h` **and** `usedPercent < moveIn` (existing 0.40)
-  **and** `R > 0`.
+  default 0.85; see §1.5).
+- Move **in** (`R → R-1`) only when `d ≤ R − 1 + h` **and** `usedPercent < moveIn` (the default
+  0.40) **and** `R > 0`.
 
 The gap of width `2h` around each integer is the region where a hovering ratio produces **no**
-move. This replaces the current `newRingDepth = determineRing() ± 1`, which recomputes the target
+move. A node already at ring 16 can never move further out, because `d` is clamped at 16 and so
+`d ≥ 16 + 1 − h` is unreachable: ring 16 is the floor of advertised responsibility, and from there
+the only remaining lever is refusing new data
+([storage.md §10](../packages/db-p2p/docs/storage.md)). This replaces the current `newRingDepth = determineRing() ± 1`, which recomputes the target
 from the noisy instantaneous formula and can disagree with the node's own advertised ring on the
 very next tick.
 
@@ -116,8 +119,8 @@ very next tick.
 space (`packages/db-p2p/docs/storage.md` §9 — SQLite, LevelDB, memory, a web store under Node). The
 decision then declines rather than substituting a number:
 
-- **`determineRing` answers ring 0**, the whole keyspace. NOT `-1`: unknown is not "low", and `-1`
-  means "below `minCapacity`", which such a node has not established.
+- **`determineRing` answers ring 0**, the whole keyspace. Unknown is not "low": a node with no
+  figure has established nothing, so it must not advertise the narrowest ring either.
 - **`shouldTransition` answers `{ shouldMove: false }` and folds NOTHING into the EWMA.** A node
   that cannot measure its storage does not shift rings, and seeding the smoothed signal from a
   figure that does not exist would carry the invention forward for many ticks after an allotment was
@@ -127,13 +130,45 @@ decision then declines rather than substituting a number:
   claiming zero. A ring where nobody said yields no stat, which falls through to the bootstrap
   estimate above.
 
+**A node that CAN measure its storage and finds too little of it** is a different case, and it
+answers the opposite end: `determineRing` returns `MAX_RING_DEPTH` (16, the deepest ring the model
+has) when `availableBytes < minCapacity`. The narrowest slice of the keyspace is the least work such
+a node can advertise, and it keeps serving what it already holds.
+
+This answer used to be the sentinel `-1`, which `createArachnodeInfo` clamped to ring 0 with no
+partition — so the node with almost no room told the network it would take the **whole** keyspace.
+The sentinel is gone: every answer is a real ring in `[0, 16]`, and `createArachnodeInfo` carries no
+clamp and no partition guard.
+
+Not "advertise no storage role at all", which was the alternative: leaving storage releases *every*
+range the node holds, which the handoff of Part 2 would then have to carry under its replication
+floor, and a node short of room must not hand everything away at once.
+
+Two consequences worth stating rather than hiding:
+
+- **A running node that falls below the minimum does not jump to ring 16.** The single-step rule of
+  §1.3 still moves it one ring per dwell. The below-minimum answer is taken at bootstrap, where
+  there is no handoff to carry, and by any other one-shot caller — which is exactly where the old
+  `-1 → ring 0` fault lived.
+- **Ring 16 is the floor of advertised responsibility** (§1.2), so from there the only remaining
+  lever is refusing new data.
+
 ### 1.5 Choosing the parameters
 
-`α`, `h`, `minDwellMs`, and the `moveOut`/`moveIn` thresholds live in `RingSelectorConfig` with the
-defaults above. They are chosen so that: (a) the dead-band width `2h ≈ 1` ring guarantees a full
+`α`, `h` and `minDwellMs` live in `RingSelectorConfig` with the defaults above, and are this
+decision's own. They are chosen so that: (a) the dead-band width `2h ≈ 1` ring guarantees a full
 integer of separation between the move-out and move-in triggers, so a node cannot satisfy both; and
 (b) `minDwellMs` ≫ the rebalance debounce/interval (5 s / 60 s) so a shift always outlives several
 topology samples. Deployments tune them; the invariant in Part 2 does not depend on their values.
+
+**The `moveOut` / `moveIn` thresholds are NOT this decision's own, and are the operator's to set.**
+They keep their names here, because "move" is this decision's vocabulary, but the node factory feeds
+them from `NodeOptions.storageAllotment.thresholds` — `moveOut` from `shedAbove` (default 0.85),
+`moveIn` from `reclaimBelow` (default 0.40). The same two figures are what `StoragePressure` names
+its `shedding` and `slack` stages from, so the ring decision and every other reaction a node has to
+filling up read one figure rather than two that can disagree. The thresholds, their validation and
+the third one (`refuseAbove`, which this decision does not read) are documented in
+[storage.md §10](../packages/db-p2p/docs/storage.md).
 
 ## Part 2 — Two-phase responsibility handoff
 
@@ -273,11 +308,14 @@ coordinator rather than inline in `libp2p-node-base.ts`:
 
 - `packages/db-p2p/src/storage/ring-selector.ts` — damping (Part 1): EWMA state, dead-band in
   `shouldTransition`, dwell timer, single-step target. `RingSelectorConfig`. Also the two
-  unknown-capacity rules of §1.4 (ring 0 from `determineRing`, no move from `shouldTransition`) and
-  the optional capacity in `createArachnodeInfo`.
+  unknown-capacity rules of §1.4 (ring 0 from `determineRing`, no move from `shouldTransition`), the
+  below-minimum answer of that same section (`MAX_RING_DEPTH` from `determineRing`) and the optional
+  capacity in `createArachnodeInfo`.
 - `packages/db-p2p/src/storage/storage-account.ts` — the one accounting the decision reads:
   `NodeOptions.storageAllotment` bounded by the free space the backend reports, measured against
   what the node's stores hold, behind one 60-second memo (`packages/db-p2p/docs/storage.md` §9).
+- `packages/db-p2p/src/storage/storage-pressure.ts` — the one READING of that accounting, and where
+  the `moveOut` / `moveIn` thresholds of §1.5 come from (`packages/db-p2p/docs/storage.md` §10).
 - `packages/db-p2p/src/storage/ring-shift-coordinator.ts` — the Part 2/3 state machine:
   `executeShift` (advertise→confirm→release for move-out; advertise-only for move-in), rollback on
   any Phase-B failure, and `reconcileOnStart` for crash mid-handoff.

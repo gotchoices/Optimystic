@@ -10,6 +10,7 @@ import type { PeerReputationService } from './reputation/peer-reputation.js';
 import type { ArrivalPushReceiver } from './matchmaking/arrival-push-receiver.js';
 import type { LinkDeadlines } from './rpc-deadline.js';
 import type { StorageAccount } from './storage/storage-account.js';
+import type { StoragePressure } from './storage/storage-pressure.js';
 import type { StorageRepo } from './storage/storage-repo.js';
 
 /**
@@ -88,6 +89,18 @@ export interface OptimysticNodeAttachmentsBase {
 	 * figure, and `usedBytes` may exceed the total on a node past its allotment.
 	 */
 	storageAccount: StorageAccount;
+	/**
+	 * How full is too full (`packages/db-p2p/docs/storage.md` §10): the node's one reading of
+	 * {@link storageAccount} against the fractions of `NodeOptions.storageAllotment.thresholds`, as an
+	 * ordered stage — `unknown`, `slack`, `steady`, `shedding`, `refusing`. Every reaction the node has
+	 * to filling up acts on this one reading rather than comparing fractions of its own.
+	 *
+	 * `stage()` is the last stage sampled, synchronously and with no I/O, which is what a path that
+	 * must not block on a disk scan reads; `read()` samples now. It samples itself once a minute on
+	 * either role, so a host normally only reads it. `unknown` means the node cannot measure its
+	 * storage and NOTHING acts — never read it as full.
+	 */
+	storagePressure: StoragePressure;
 	/**
 	 * The node's blob service (docs/blobs.md §The node's blob service), over the `pieces` of
 	 * `NodeOptions.storage` and the blob records in its `kv`. On a client too: the machine a blob is put on holds

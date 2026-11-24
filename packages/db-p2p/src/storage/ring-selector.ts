@@ -22,16 +22,30 @@ const DEPTH_EPSILON = 1e-12;
  * second copy of the number.
  */
 export const DEFAULT_MIN_RING_CAPACITY_BYTES = 100 * 1024 * 1024;
+/**
+ * The deepest ring the model has: 2^16 = 65536 partitions, the narrowest slice of the keyspace a
+ * node can be responsible for. It is both the cap on every answer and the ANSWER for a node whose
+ * available bytes are below {@link RingSelectorConfig.minCapacity} — the narrowest slice is the least
+ * work such a node can advertise, and leaving storage entirely would release every range it holds at
+ * once (`docs/arachnode-ring-handoff.md` §1.4).
+ */
+export const MAX_RING_DEPTH = 16;
 
 export interface RingSelectorConfig {
 	/** Minimum storage capacity in bytes */
 	minCapacity: number;
 
-	/** Thresholds for ring transitions */
+	/**
+	 * Thresholds for ring transitions, as fractions of the node's effective total. "Move" is this
+	 * decision's own vocabulary, but the FIGURES are not its own: the node factory feeds them from
+	 * `storageAllotment.thresholds` — `moveOut` from `shedAbove`, `moveIn` from `reclaimBelow` — so
+	 * there is one figure with two readers (this and `StoragePressure`) rather than two figures that
+	 * can disagree about whether the node is under pressure.
+	 */
 	thresholds: {
-		/** Move to outer ring when used > this % */
+		/** Move to outer ring when used > this fraction; `storageAllotment.thresholds.shedAbove`. */
 		moveOut: number;
-		/** Move to inner ring when used < this % */
+		/** Move to inner ring when used < this fraction; `storageAllotment.thresholds.reclaimBelow`. */
 		moveIn: number;
 	};
 
@@ -109,15 +123,24 @@ export class RingSelector {
 
 		if (capacity.availableBytes === undefined) {
 			// No allotment configured and no free-space figure from the backend: the node cannot
-			// price its coverage at all, so it takes the whole keyspace. NOT -1, which means
-			// "below minCapacity" — a claim this node has not established and must not make on a
+			// price its coverage at all, so it takes the whole keyspace. Unknown is NOT low — a node
+			// with no figure has established nothing, and must not advertise the narrowest ring on a
 			// figure it does not have.
 			return 0;
 		}
 
 		if (capacity.availableBytes < this.config.minCapacity) {
-			// Not enough capacity for any ring
-			return -1;
+			// Too little room to serve a real slice, so the node advertises the DEEPEST ring it allows:
+			// the narrowest slice the ring model has, and the least responsibility it can claim while
+			// still serving what it already holds. This answer used to be -1, which
+			// `createArachnodeInfo` clamped to ring 0 — so the node with almost no room told the
+			// network it would take the whole keyspace.
+			//
+			// Not "no storage role at all": leaving storage releases EVERY range the node holds, which
+			// the handoff protocol would then have to carry under its replication floor, and a node
+			// short of room must not hand everything away at once (`docs/arachnode-ring-handoff.md`
+			// §1.4).
+			return MAX_RING_DEPTH;
 		}
 
 		const estimatedTotalData = this.estimateNetworkData(capacity.availableBytes);
@@ -130,7 +153,7 @@ export class RingSelector {
 		// If coverage = 1.0 (100%), we can handle full keyspace = Ring 0
 		const ringDepth = Math.max(0, Math.ceil(-Math.log2(Math.max(0.001, coverage))));
 
-		return Math.min(ringDepth, 16); // Cap at Ring 16 (65536 partitions)
+		return Math.min(ringDepth, MAX_RING_DEPTH);
 	}
 
 	// NOTE: prefix extraction lives in `arachnode-partition.ts` (single source of truth shared with
@@ -193,7 +216,7 @@ export class RingSelector {
 		const totalData = this.smoothedTotalData ?? 0;
 		const coverage = totalData > 0 ? available / totalData : 1;
 		const depth = -Math.log2(Math.max(DEPTH_EPSILON, coverage));
-		return Math.min(16, Math.max(0, depth));
+		return Math.min(MAX_RING_DEPTH, Math.max(0, depth));
 	}
 
 	/**
@@ -231,12 +254,13 @@ export class RingSelector {
 	async createArachnodeInfo(peerId: string, ringDepthOverride?: number): Promise<ArachnodeInfo> {
 		const capacity = await this.storageAccount.capacity();
 		const ringDepth = ringDepthOverride ?? await this.determineRing();
-		const partition = ringDepth >= 0
-			? await this.calculatePartition(ringDepth, peerId)
-			: undefined;
+		// No guard and no clamp: every answer `determineRing` gives is a real ring in [0, 16] now that
+		// the -1 sentinel is gone, so a node short of room advertises the narrowest slice and its
+		// partition rather than the whole keyspace and none.
+		const partition = await this.calculatePartition(ringDepth, peerId);
 
 		return {
-			ringDepth: Math.max(0, ringDepth),
+			ringDepth,
 			partition,
 			// A node that cannot measure its storage advertises NO capacity rather than a made-up
 			// one. The field is omitted entirely, which is what `ArachnodeFretAdapter.getRingStats`
@@ -301,7 +325,7 @@ export class RingSelector {
 		// Hysteresis anchor: the node's currently-advertised ring. Fall back to the smoothed depth
 		// only in the pathological case where nothing has been advertised yet (production always
 		// advertises at bootstrap before the first tick).
-		const advertisedRing = info?.ringDepth ?? Math.min(16, Math.max(0, Math.round(d)));
+		const advertisedRing = info?.ringDepth ?? Math.min(MAX_RING_DEPTH, Math.max(0, Math.round(d)));
 
 		// No re-entrant shift: a move already in flight (advertise→confirm→release) owns the ring.
 		if (info?.status === 'moving') {
@@ -320,6 +344,12 @@ export class RingSelector {
 
 		const h = this.config.deadband ?? DEFAULT_DEADBAND;
 
+		// NOTE: a node already at MAX_RING_DEPTH can never move further out — `d` is clamped at
+		// 16, so `d >= 16 + 1 - h` is unreachable. Ring 16 is the floor of advertised responsibility,
+		// and from there the only remaining lever is refusing new data (`StoragePressure`'s `refusing`
+		// stage). A running node that falls below `minCapacity` does not jump there either: the
+		// single-step rule below moves one ring per dwell, and the below-minimum answer
+		// `determineRing` gives is taken at bootstrap and by other one-shot callers.
 		// Move OUT (R → R+1): smoothed depth solidly past the outer boundary AND storage pressure high.
 		if (d >= advertisedRing + 1 - h && usedPercent > this.config.thresholds.moveOut) {
 			this.lastMoveAt = this.now();

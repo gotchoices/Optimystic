@@ -132,16 +132,20 @@ function isSized(blob: CachedBlob): blob is CachedBlob & { readonly bytes: numbe
 	return blob.bytes !== undefined;
 }
 
-// NOTE: only a read or fetch that pulled something triggers an enforcement, so a blob that becomes
-// cache-only when some other hold is released — an `unpin`, or one of the `responsible` and `owed`
-// releases `BlobReclaimPass` in `packages/db-p2p/src/blob/reclaim-pass.ts` makes — can leave the cache
-// over budget until the next read that fetches or the next restart. If a node is ever seen sitting
-// over budget with its reads idle, call `request()` from those releases too.
+// NOTE: a blob that becomes cache-only when some other hold is released — an `unpin`, or one of the
+// `responsible` and `owed` releases `BlobReclaimPass` in
+// `packages/db-p2p/src/blob/reclaim-pass.ts` makes — still triggers no enforcement of its own, so the
+// cache can sit over budget until the next pressure sample, the next read that fetches, or the next
+// restart. The pressure sample bounds that wait to a minute on a node under pressure, which is where
+// it matters; if a node at `steady` is ever seen sitting over budget with its reads idle, call
+// `request()` from those releases too.
 /**
- * Keeps the blobs held only for reads within a byte budget (docs/blobs.md §Lifetime). Enforced after
- * a read or fetch that pulled anything and once when the node has built its blob service — there is
- * no timer, because the cache grows only through reads that fetch and each of those triggers an
- * enforcement.
+ * Keeps the blobs held only for reads within a byte budget (docs/blobs.md §Lifetime). Enforced from
+ * three places: after a read or fetch that pulled anything, once when the node has built its blob
+ * service, and on every pressure sample that finds the node at `shedding` or above
+ * (`StoragePressure` in `packages/db-p2p/src/storage/storage-pressure.ts`). That last one is what
+ * shrinks the cache as the node fills up without a read having to arrive: `cacheBudgetBytes` already
+ * falls to 0 as other use fills the allotment, but nothing used to ask.
  */
 export class BlobCacheBudget {
 	private readonly records: BlobCacheRecords;

@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
-import { RingSelector, type RingSelectorConfig } from '../src/storage/ring-selector.js';
+import { MAX_RING_DEPTH, RingSelector, type RingSelectorConfig } from '../src/storage/ring-selector.js';
 import type { ArachnodeFretAdapter, ArachnodeInfo } from '../src/storage/arachnode-fret-adapter.js';
 import type { StorageCapacity } from '../src/storage/storage-account.js';
 
@@ -102,16 +102,19 @@ describe('RingSelector', () => {
 	});
 
 	describe('determineRing', () => {
-		it('returns -1 when capacity below minimum', async () => {
+		it('answers the DEEPEST ring when capacity is below the minimum', async () => {
+			// The narrowest slice of the keyspace is the least work a node short of room can advertise.
+			// This answer used to be -1, which `createArachnodeInfo` clamped to ring 0 — so the node
+			// with almost no room told the network it would take the WHOLE keyspace.
 			account.setCapacity(512 * 1024, 0); // 512KB, below 1MB minimum
 			const ring = await selector.determineRing();
-			expect(ring).to.equal(-1);
+			expect(ring).to.equal(MAX_RING_DEPTH);
 		});
 
-		it('answers ring 0, not -1, when the node cannot measure its storage', async () => {
-			// Unknown is not "low": -1 means "below minCapacity", a claim a node with no figure has
-			// not established. Ring 0 (the whole keyspace) is also where observed ring stats cannot
-			// specialize such a node away from.
+		it('answers ring 0, not the deepest ring, when the node cannot measure its storage', async () => {
+			// Unknown is not "low": a node with no figure has established nothing, so it must not
+			// advertise the narrowest ring either. Ring 0 (the whole keyspace) is also where observed
+			// ring stats cannot specialize such a node away from.
 			account.setUnknownCapacity();
 			fretAdapter.setRingStats([{ ringDepth: 0, peerCount: 8, avgCapacity: 100 * 1024 * 1024 }]);
 			expect(await selector.determineRing()).to.equal(0);
@@ -476,12 +479,14 @@ describe('RingSelector', () => {
 			expect(info.status).to.equal('active');
 		});
 
-		it('handles below-minimum capacity gracefully', async () => {
+		it('advertises the deepest ring, with its partition, when capacity is below the minimum', async () => {
 			account.setCapacity(100, 0); // Way below minimum
 			const info = await selector.createArachnodeInfo(peerIds[0]!);
 
-			// ringDepth becomes max(0, -1) = 0 when below minimum
-			expect(info.ringDepth).to.equal(0);
+			// The narrowest slice, and a REAL partition for it: the old -1 sentinel was clamped to ring 0
+			// here and skipped the partition, so the node advertised the whole keyspace.
+			expect(info.ringDepth).to.equal(MAX_RING_DEPTH);
+			expect(info.partition?.prefixBits).to.equal(MAX_RING_DEPTH);
 			expect(info.status).to.equal('active');
 		});
 

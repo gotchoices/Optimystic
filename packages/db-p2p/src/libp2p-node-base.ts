@@ -84,9 +84,10 @@ import { resolveBootstrapContactTimeoutMs, resolveLibp2pDialTimeoutMs, resolveLi
 import type { ClusterLatestAnswer, ClusterLatestCallback } from './repo/coordinator-repo.js';
 import type { ClusterLatestBatchCallback } from './repo/consult-round.js';
 import { RestorationCoordinator } from './storage/restoration-coordinator.js';
-import { DEFAULT_MIN_RING_CAPACITY_BYTES, RingSelector } from './storage/ring-selector.js';
+import { DEFAULT_MIN_RING_CAPACITY_BYTES, MAX_RING_DEPTH, RingSelector } from './storage/ring-selector.js';
 import { RingShiftCoordinator } from './storage/ring-shift-coordinator.js';
 import { cacheBudgetBytes, StorageAccount } from './storage/storage-account.js';
+import { resolveStoragePressureThresholds, StoragePressure, type StoragePressureThresholds } from './storage/storage-pressure.js';
 import type { StorageAllotmentOptions, StorageCapacity } from './storage/storage-account.js';
 import { ArachnodeFretAdapter } from './storage/arachnode-fret-adapter.js';
 import type { RestoreCallback, BlockArchive } from './storage/struct.js';
@@ -331,8 +332,18 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * whole keyspace, and never shifts rings on storage grounds. An allotment larger than the disk is
 	 * bounded by the disk. `bytes` must be an integer above 0 or node construction throws.
 	 *
+	 * `thresholds` is the fractions of that total at which the node changes what it does —
+	 * `reclaimBelow` (0.40), `shedAbove` (0.85) and `refuseAbove` (0.95) by default. They are what
+	 * `node.storagePressure` names its stages from, and the ring decision's `moveOut` / `moveIn` are
+	 * fed from the first two, so there is one figure with two readers
+	 * (`packages/db-p2p/docs/storage.md` §10). Each must be a finite number strictly between 0 and 1,
+	 * and `reclaimBelow < shedAbove < refuseAbove` must hold, or node construction throws rather than
+	 * clamping: an operator who inverted two of them would otherwise get a node that sheds and
+	 * reclaims at once.
+	 *
 	 * NOT a serving-only option: a client node fills the same disk with blob records, blob pieces and
-	 * the owed-blob ledger, so it is given an allotment too and exposes the same `node.storageAccount`.
+	 * the owed-blob ledger, so it is given an allotment too and exposes the same `node.storageAccount`
+	 * and `node.storagePressure`.
 	 */
 	storageAllotment?: StorageAllotmentOptions;
 	/**
@@ -947,15 +958,10 @@ async function logStorageAllotment(account: StorageAccount): Promise<void> {
 	wiringLog('storage allotment: %s; %s — so this node may use %s, of which %s is used',
 		allotmentClause, locationClause, formatBytes(totalBytes), formatBytes(usedBytes));
 	// Said separately because it is a different fact: ring selection will not size such a node from
-	// its storage at all.
-	// NOTE: it says what the node DOES, which is not what it should do. `determineRing` answers -1
-	// below this floor and `createArachnodeInfo` clamps that to ring 0 with no partition, so the node
-	// that can serve least advertises the whole keyspace. Do not make this line claim the node serves
-	// nothing until that is true; the fix belongs with the work that makes a node act on its
-	// allotment, which owns `determineRing`'s answer below the floor.
+	// its storage at all, and it advertises the narrowest slice the ring model has instead.
 	if (allotmentBytes !== undefined && allotmentBytes < DEFAULT_MIN_RING_CAPACITY_BYTES) {
-		wiringLog('storage allotment: %s is below the %s ring selection needs before it will size this node from its storage, so no ring is chosen from the allotment and the node advertises ring 0 (the whole keyspace) regardless. Raise the allotment if you meant this node to serve a slice of the keyspace.',
-			formatBytes(allotmentBytes), formatBytes(DEFAULT_MIN_RING_CAPACITY_BYTES));
+		wiringLog('storage allotment: %s is below the %s ring selection needs before it will size this node from its storage, so no ring is chosen from the allotment and the node advertises ring %d — the narrowest slice of the keyspace there is — and keeps serving what it already holds. Raise the allotment if you meant this node to serve a real slice of the keyspace.',
+			formatBytes(allotmentBytes), formatBytes(DEFAULT_MIN_RING_CAPACITY_BYTES), MAX_RING_DEPTH);
 	}
 }
 
@@ -1401,6 +1407,10 @@ export async function createLibp2pNodeBase(
 	// Checked here, for the third time for the same reason: a host that mistyped the allotment is
 	// told before anything starts rather than being given a different figure to hold blocks against.
 	assertStorageAllotmentBytes(options.storageAllotment?.bytes);
+	// And the fractions of it at which the node changes what it does, resolved once here so the ring
+	// decision and the pressure reading below are fed the SAME figures rather than each carrying its
+	// own literals. Throws on a value outside (0, 1) or an order an operator cannot have meant.
+	const storagePressureThresholds = resolveStoragePressureThresholds(options.storageAllotment?.thresholds);
 	// The node's ONE accounting of its disk, on either role and OUTSIDE the arachnode gate below, so
 	// ring selection, the blob cache budget and an operator's dashboard read one memoized scan rather
 	// than each forming its own opinion of how full the machine is. A client has one because it fills
@@ -1410,6 +1420,22 @@ export async function createLibp2pNodeBase(
 	// option is a thunk so that a node whose blob service is built AFTER its account can still be
 	// given one, and reading it through the thunk keeps that true however the order here changes.
 	const storageAccount = new StorageAccount(nodeStorage, { ...options.storageAllotment, blobRecords: () => blobs });
+	// The node's ONE reading of that measurement (`packages/db-p2p/docs/storage.md` §10): the account
+	// says how full the node is, this says whether that is too full. Outside the arachnode gate for the
+	// reason the account is — a client node has blobs, a read cache and an allotment, so it reads its
+	// pressure too, and the arachnode tick is not what samples it.
+	//
+	// The cache enforcement is reached through a `let` assigned later in the factory, as
+	// `NodeBlobService`'s `requestCacheEnforcement` is: the budget needs the started node's blob
+	// service, while this is built before `createLibp2p`. Read, not captured, on every sample, and a
+	// sample that lands before the budget exists asks nothing — the budget runs one enforcement of its
+	// own as soon as it is built.
+	let blobCacheBudgetForPressure: BlobCacheBudget | undefined;
+	const storagePressure = new StoragePressure({
+		account: storageAccount,
+		thresholds: storagePressureThresholds,
+		requestCacheEnforcement: () => blobCacheBudgetForPressure?.request()
+	});
 	// Before anything starts, beside the durability line, and awaited so an operator reading the
 	// start-up log sees the allotment next to what the node's writes survive.
 	// NOTE: with `node-wiring` logging ON this makes node construction wait on one block-store scan —
@@ -1895,7 +1921,7 @@ export async function createLibp2pNodeBase(
 			? await wireServingRole({
 				node, options, serving, keyNetwork, protocolPrefix, linkDeadlines, consensusConfig, reputation,
 				fretSvc, nodePrivateKey, onCommitCertificate, membership, networkManager, storageAccount,
-				partitionDetector
+				storagePressure, pressureThresholds: storagePressureThresholds, partitionDetector
 			})
 			: undefined;
 
@@ -1939,6 +1965,23 @@ export async function createLibp2pNodeBase(
 		}
 		// Once, now: a budget lowered across a restart is applied to what the last run cached.
 		blobCacheBudget.request();
+		// The pressure reading now has a cache to enforce, so its sampler can start. The first sample
+		// lands as soon as the event loop turns — never inside node construction — so a node that comes
+		// back already over its allotment reads `refusing` at once rather than a sample interval later.
+		// Its stop wrapper goes on AFTER the cache budget's (installed just above), so it runs BEFORE it
+		// and no sample asks a stopped budget to enforce.
+		blobCacheBudgetForPressure = blobCacheBudget;
+		storagePressure.start();
+		{
+			const previousStop = node.stop.bind(node);
+			node.stop = async () => {
+				try {
+					await storagePressure.stop();
+				} finally {
+					await previousStop();
+				}
+			};
+		}
 		// `node.blobs`. The blob protocol service keeps answering from `blobs`: a peer's stat is about
 		// what this node holds, and must not start a probe of its own.
 		const nodeBlobs = new NodeBlobService({
@@ -2228,6 +2271,7 @@ export async function createLibp2pNodeBase(
 			cohortReachability,
 			hlcClock,
 			storageAccount,
+			storagePressure,
 			blobs: nodeBlobs,
 			blobReclaim,
 		};
@@ -2798,6 +2842,10 @@ interface ServingRoleContext {
 	networkManager: NetworkManagerService | undefined;
 	/** The node's one storage accounting, built for both roles; ring selection prices its coverage from it. */
 	storageAccount: StorageAccount;
+	/** The node's one pressure reading over that account, built for both roles; the ring tick names the stage it moved at from it. */
+	storagePressure: StoragePressure;
+	/** The resolved `storageAllotment.thresholds`, so the ring decision moves on the same figures the pressure reading names stages from. */
+	pressureThresholds: StoragePressureThresholds;
 	/** The node's one partition detector, built beside the key network; this role is the only half that feeds it. */
 	partitionDetector: PartitionDetector;
 }
@@ -2829,7 +2877,7 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 	const {
 		node, options, serving, keyNetwork, protocolPrefix, linkDeadlines, consensusConfig, reputation,
 		fretSvc, nodePrivateKey, onCommitCertificate, membership, networkManager, storageAccount,
-		partitionDetector
+		storagePressure, pressureThresholds, partitionDetector
 	} = ctx;
 	const { storageRepo, rawStorage, underReplicationLedger, transactionStateStore, durabilityWindowFor, onBlockHolders } = serving;
 	const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix, linkDeadlines);
@@ -3309,9 +3357,13 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 			// line reported and the cache budget spends against.
 			const ringSelector = new RingSelector(fretAdapter, storageAccount, {
 				minCapacity: DEFAULT_MIN_RING_CAPACITY_BYTES,
+				// From the one resolved set of thresholds, not two literals here: the figure the ring
+				// decision moves on and the figure `node.storagePressure` names a stage from are the same
+				// figure, so they cannot disagree about whether this node is under pressure, and an
+				// operator who set `storageAllotment.thresholds` changed both.
 				thresholds: {
-					moveOut: 0.85,
-					moveIn: 0.40
+					moveOut: pressureThresholds.shedAbove,
+					moveIn: pressureThresholds.reclaimBelow
 				},
 				// Damping so the ring decision cannot thrash near a boundary
 				// (docs/arachnode-ring-handoff.md § Part 1).
@@ -3523,7 +3575,10 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 					return;
 				}
 				if (transition.shouldMove && transition.direction && transition.newRingDepth !== undefined) {
-					log('Ring transition needed: moving %s to Ring %d', transition.direction, transition.newRingDepth);
+					// The stage comes from `stage()` — the last sample the node's own pressure timer took,
+					// read synchronously — rather than from a scan of this tick's own: the two would be the
+					// same memoized figure, and the ring decision above has already asked for it.
+					log('Ring transition needed: moving %s to Ring %d (storage pressure: %s)', transition.direction, transition.newRingDepth, storagePressure.stage());
 					try {
 						const outcome = await ringShift.executeShift({
 							direction: transition.direction,
