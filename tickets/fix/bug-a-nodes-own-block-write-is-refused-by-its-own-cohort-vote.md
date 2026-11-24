@@ -36,3 +36,7 @@ The question is how a cohort member can be told, without trusting the claim, tha
 Whatever shape is chosen, the member-side behaviour for every *other* writer must not change, and the exemption must remain unforgeable from the wire — that is the whole reason the solo gate's exemption is safe today.
 
 Worth stating plainly for whoever triages this: the alternative resolution is to decide that the stated rule does not extend to block pends at all, and that a node above `refuseAbove` refuses everyone including itself. That is a coherent position — it is one threshold instead of two — but it contradicts what `storage.md` §10 says today and what the solo gate already does, so it would mean changing those rather than leaving the inconsistency standing.
+
+## Promoted to fix (garden, 2026-11-24)
+
+Pulled into this release: the out-of-space refusal it concerns was added by `3.5-a-full-cohort-member-refuses-a-pend` and is not yet released, so the release should ship that refusal with this corrected rather than leave it for a later one.
