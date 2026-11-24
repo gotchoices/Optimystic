@@ -30,3 +30,7 @@ Not observed running — read out of the code. What would confirm it is a test t
 The recorded version must be the one the release decision was made on, not one read afterwards. That means capturing the held version at or before the point the handoff releases the range — inside the ring shift's confirm/release step, and at the confirmed rebalance release — and handing it to the ledger, rather than having the ledger go and look. Then any write at all after that point moves the version past what was recorded, and the sweep declines, which is the safe direction in every ordering.
 
 Both release paths need the same treatment; a fix on one of them leaves the class open on the other.
+
+## Promoted to fix (garden, 2026-11-23)
+
+Pulled into this release: the deletion it races was added by `3.3-a-node-deletes-what-it-released` and is not yet released, so the release should not introduce it with a known window in which a block the node is serving can be deleted, however rare.
