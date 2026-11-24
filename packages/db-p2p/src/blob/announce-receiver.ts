@@ -37,9 +37,13 @@ export interface BlobAnnounceReceiverDeps {
 	fetcher: Pick<BlobFetcher, 'start'>;
 	client: Pick<BlobProtocolClient, 'held'>;
 	/**
-	 * How full this node is (`packages/db-p2p/docs/storage.md` §10). A node at `refusing` answers
-	 * `out-of-space` rather than taking a new `responsible` hold. Absent — a receiver built without a
-	 * pressure reading — refuses nothing, which is also what a node that cannot measure itself does.
+	 * How full this node is (`packages/db-p2p/docs/storage.md` §10). Read by BOTH paths that would take
+	 * a new `responsible` hold, so the two cannot disagree about whether this node takes one: a node at
+	 * `refusing` answers an announcement `out-of-space` ({@link BlobAnnounceReceiver.decide}) and takes
+	 * no hold on a blob its own read brought here ({@link BlobAnnounceReceiver.keepAfterRead}).
+	 *
+	 * Absent — a receiver built without a pressure reading — refuses nothing, which is also what a node
+	 * that cannot measure itself does.
 	 */
 	storagePressure?: Pick<StoragePressure, 'refusingNewData'>;
 	/** How long `decide` may spend reading committed state before it answers `unreferenced`: half the node's `responseTimeoutMs`. */
@@ -92,9 +96,9 @@ export class BlobAnnounceReceiver {
 	}
 
 	/**
-	 * Keeps a blob a read brought here under a `responsible` hold when this node is in its cohort and
-	 * committed state references it (docs/blobs.md §Placement, copying and durability, "Readers
-	 * repair"). Fire and forget: it returns at once and never throws.
+	 * Keeps a blob a read brought here under a `responsible` hold when this node is in its cohort,
+	 * has room, and committed state references it (docs/blobs.md §Placement, copying and durability,
+	 * "Readers repair"). Fire and forget: it returns at once and never throws.
 	 */
 	keepAfterRead(ref: BlobRef): void {
 		if (this.deps.hold === 'on-demand' || this.repairing.has(ref)) {
@@ -313,6 +317,18 @@ export class BlobAnnounceReceiver {
 			}
 			if (await this.deps.local.responsibleScope(ref) !== undefined) {
 				return;	// already responsible: nothing to verify and nothing to write
+			}
+			// The same door the announcement path closes, and for the same reason: a `responsible` hold is a
+			// promise to keep bytes the network's other copies may be released against, and a node that
+			// refuses to take this very blob when a PEER offers it must not take it because it happened to
+			// read it. It is also the one path that would make a full node fuller without writing a byte —
+			// the hold moves bytes out of the read cache's reach, so the cache enforcement the same
+			// `refusing` sample triggers could no longer free them. The fetch's `cached` hold is left exactly
+			// as it is, so the blob is still served and still evictable. Before the reference read, as in
+			// `decided`: a node that will not take the hold should spend no read slot proving it could.
+			if (this.deps.storagePressure?.refusingNewData() === true) {
+				log('read:out-of-space ref=%s (no responsible hold taken)', ref);
+				return;
 			}
 			// Under the shared read limit but against no per-peer allowance: this node asked itself.
 			const verdict = await this.deps.limiter.readSlot(() => this.deps.references.anywhere(ref));

@@ -275,10 +275,18 @@ export class SpreadOnChurnMonitor implements Startable {
 				log('push:ok block=%s target=%s', blockId, targetId)
 			}
 			for (const refusal of outcome.refusals) {
+				// Exhaustive on purpose: only `unreachable` carries an `error`, so a reason that fell into a
+				// catch-all would be logged as a dial failure with `err=undefined`. The `never` binding makes
+				// the next reason added to `PushRefusal` a compile error here rather than a wrong log line.
 				if (refusal.reason === 'rejected') {
 					log('push:rejected block=%s target=%s (receiver did not persist)', blockId, refusal.peerId)
-				} else {
+				} else if (refusal.reason === 'out-of-space') {
+					log('push:peer-full block=%s target=%s (receiver is out of space; nothing verified or persisted)', blockId, refusal.peerId)
+				} else if (refusal.reason === 'unreachable') {
 					log('push:fail block=%s target=%s err=%s', blockId, refusal.peerId, refusal.error)
+				} else {
+					const exhaustive: never = refusal.reason
+					log('push:fail block=%s target=%s reason=%s', blockId, refusal.peerId, exhaustive)
 				}
 			}
 

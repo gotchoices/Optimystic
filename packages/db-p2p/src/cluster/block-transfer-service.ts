@@ -476,14 +476,9 @@ export class BlockTransferService implements Startable {
 	 * else — see {@link BlockTransferServiceComponents.storagePressure}.
 	 */
 	private async handlePush(request: BlockTransferRequest, senderPeerId?: string): Promise<BlockTransferResponse> {
-		const accepted: string[] = [];
-		const missing: string[] = [];
-		/** Deduplicated: several blocks of one commit reference one hash. */
-		const unresolvedProofs = new Set<string>();
-
-		// Ahead of validation AND certification on purpose: a node that is going to refuse this request
-		// should not first spend CPU on signatures it will refuse anyway (the NOTE below on the
-		// unbounded per-request verification cost). Nothing was persisted and nothing was certified, so
+		// The FIRST statement, ahead of validation AND certification on purpose: a node that is going to
+		// refuse this request should not first spend CPU on signatures it will refuse anyway (the NOTE
+		// below on the unbounded per-request verification cost). Nothing was persisted and nothing was certified, so
 		// every requested id is reported `missing`, as it is for a fault — a sender that does not read
 		// `outOfSpace` behaves exactly as it does today.
 		//
@@ -495,6 +490,11 @@ export class BlockTransferService implements Startable {
 			log('push:out-of-space blocks=%d reason=%s (refused before verification)', request.blockIds.length, request.reason);
 			return { accepted: [], missing: request.blockIds, outOfSpace: true };
 		}
+
+		const accepted: string[] = [];
+		const missing: string[] = [];
+		/** Deduplicated: several blocks of one commit reference one hash. */
+		const unresolvedProofs = new Set<string>();
 
 		if (!request.blocks) {
 			return { accepted: [], missing: request.blockIds };

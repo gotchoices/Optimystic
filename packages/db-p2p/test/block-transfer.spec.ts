@@ -493,6 +493,37 @@ describe('BlockTransferCoordinator', () => {
 				.to.deep.equal([goodPeer.toString()]);
 		});
 
+		it('a grown block whose new peer is out of space is incomplete even when the floor was met', async () => {
+			// The out-of-space rule is checked AHEAD of the floor, which only this shape distinguishes: the
+			// floor is reached (one confirming peer, floor 1) and the block is STILL reported incomplete,
+			// because recording the full peer satisfied would enter it in `RebalanceMonitor`'s seen set —
+			// cleared only by a departure from the cohort — and being full is a condition that clears. The
+			// full peer is listed first so the loop asks it before `stopAfterConfirmed` is reached.
+			repo.blocks.set('block-kept', makeBlock('block-kept'));
+			const fullPeer = await makePeerId();
+			const goodPeer = await makePeerId();
+			peerNetwork.responses.set(fullPeer.toString(), { accepted: [], missing: ['block-kept'], outOfSpace: true });
+			peerNetwork.responses.set(goodPeer.toString(), { accepted: ['block-kept'], missing: [] });
+
+			const event: RebalanceEvent = {
+				gained: [],
+				lost: [],
+				newOwners: new Map(),
+				grown: new Map([['block-kept', [fullPeer.toString(), goodPeer.toString()]]]),
+				floor: 1,
+				triggeredAt: Date.now()
+			};
+
+			const result = await coordinator.handleRebalanceEvent(event);
+
+			expect(result.replicated, 'a block with a full new peer is not reported replicated').to.deep.equal([]);
+			expect(result.underReplicated).to.deep.equal(['block-kept']);
+			const outcome = result.growth.get('block-kept');
+			expect(outcome!.complete, 'floor met, but a full peer leaves the growth incomplete').to.equal(false);
+			expect(outcome!.satisfiedPeers, 'ONLY the confirming peer is satisfied — the full one is offered the block again')
+				.to.deep.equal([goodPeer.toString()]);
+		});
+
 		it('a grown block with no local data is reported underReplicated without dialing (gained∩grown case)', async () => {
 			// The block was only just gained (nothing local yet) but the first observation also lists the
 			// cohort as grown. The push finds no local bytes and no-ops — benign: those cohort peers are

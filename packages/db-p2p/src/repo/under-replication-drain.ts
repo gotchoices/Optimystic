@@ -302,13 +302,23 @@ export class UnderReplicationDrain implements Startable {
 	/** Log each refusal so "cannot place" reads differently from "cannot reach", and count the round. */
 	private noteRefusals(entry: UnderReplicatedEntry, outcome: PushBlockOutcome & { status: 'pushed' }, context: BlockDrainContext): void {
 		for (const refusal of outcome.refusals) {
+			// Exhaustive on purpose: only `unreachable` carries an `error`, so a reason that fell into a
+			// catch-all would be logged as a dial failure with `err=undefined`. The `never` binding makes
+			// the next reason added to `PushRefusal` a compile error here rather than a wrong log line.
 			if (refusal.reason === 'rejected') {
 				// Uncertified means this node retained no proof for the revision: the receiver's
 				// default policy refuses it, and no retry changes that until the block is rewritten.
 				log('push:rejected block=%s peer=%s rev=%d certified=%s%s', entry.blockId, refusal.peerId, entry.rev,
 					outcome.certified, outcome.certified ? '' : ' (no retained proof — cannot place)');
-			} else {
+			} else if (refusal.reason === 'out-of-space') {
+				// A condition that clears, so it is counted under the give-up rule like an unreachable peer
+				// (below) rather than read as "cannot place": the next pass asks again.
+				log('push:peer-full block=%s peer=%s (receiver is out of space; nothing verified or persisted)', entry.blockId, refusal.peerId);
+			} else if (refusal.reason === 'unreachable') {
 				log('push:unreachable block=%s peer=%s err=%s', entry.blockId, refusal.peerId, refusal.error);
+			} else {
+				const exhaustive: never = refusal.reason;
+				log('push:unreachable block=%s peer=%s reason=%s', entry.blockId, refusal.peerId, exhaustive);
 			}
 			context.noteFailure(refusal.peerId);
 		}

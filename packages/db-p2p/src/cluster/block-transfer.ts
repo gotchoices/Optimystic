@@ -19,8 +19,15 @@ function logRefusals(path: 'push' | 'confirm', blockId: string, refusals: readon
 			// but an operator reading a handoff that will not confirm could not tell new owners that are
 			// full from ones that are unreachable or lack the proof.
 			log('%s:peer-full block=%s peer=%s (receiver is out of space; nothing verified or persisted)', path, blockId, refusal.peerId);
-		} else {
+		} else if (refusal.reason === 'rejected') {
 			log('%s:peer-rejected block=%s peer=%s (receiver did not persist)', path, blockId, refusal.peerId);
+		} else {
+			// Exhaustive on purpose, here and at the two other senders that read these reasons
+			// (`SpreadOnChurnMonitor`, `UnderReplicationDrain`): only `unreachable` carries an `error`, so a
+			// reason that fell into a catch-all would be logged as a dial failure with `err=undefined`. The
+			// `never` binding makes the next reason added a compile error rather than a wrong log line.
+			const exhaustive: never = refusal.reason;
+			log('%s:peer-rejected block=%s peer=%s reason=%s', path, blockId, refusal.peerId, exhaustive);
 		}
 	}
 }
@@ -272,6 +279,14 @@ export class BlockTransferCoordinator {
 				// Ahead of the floor-met branch: see the per-block rules above. Incomplete counts an
 				// attempt, so the monitor re-detects the block on its next check and gives up on the peer
 				// after `growthMaxAttempts` — which a departure from the cohort then clears.
+				//
+				// NOTE: a block whose floor WAS met still spends its growth attempts here, so a cohort
+				// carrying a few permanently full members re-checks every such block `growthMaxAttempts`
+				// times before settling. Bounded and cheap today (the re-check costs one push round per
+				// attempt, and nothing is released off the unconfirmed list). If a deployment where many
+				// members sit at `refusing` ever shows these re-checks in its logs, report the block
+				// complete once the floor is met and carry the full peers as a separate "offer again later"
+				// list rather than spending the block's attempts on them.
 				log('grow:out-of-space block=%s peers=%d/%d', blockId, full.length, newPeers.length);
 				unconfirmed.push(blockId);
 				growth.set(blockId, { satisfiedPeers: [...result.confirmedPeers], complete: false });

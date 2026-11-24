@@ -28,6 +28,8 @@ interface ReceiverOver {
 	cohort: readonly string[];
 	fetcher?: BlobAnnounceReceiverDeps['fetcher'];
 	client?: BlobAnnounceReceiverDeps['client'];
+	/** Default: no reading at all, which is what a node that cannot measure its storage behaves as. */
+	storagePressure?: BlobAnnounceReceiverDeps['storagePressure'];
 }
 
 /** Lets the pending microtasks of a call under test run before the next assertion. */
@@ -55,6 +57,7 @@ async function receiverOver(over: ReceiverOver): Promise<{ receiver: BlobAnnounc
 		local,
 		fetcher: over.fetcher ?? { start: () => { throw new Error('no answer in this spec starts a pull'); } },
 		client: over.client ?? { held: () => Promise.reject(new Error('no answer in this spec sends held')) },
+		...(over.storagePressure ? { storagePressure: over.storagePressure } : {}),
 		answerWithinMs: 1_000,
 		// No answer here waits on the budget, so a timer that never fires keeps the spec off the clock.
 		setTimer: () => () => undefined,
@@ -73,6 +76,32 @@ describe('blob announce receiver', () => {
 			const { receiver, local, ref } = await receiverOver({ hold, cohort });
 			expect(await receiver.decide(ANNOUNCER, ref, scope), what).to.equal(answer);
 			expect(await local.responsibleScope(ref), `${what}: no responsible hold`).to.equal(undefined);
+		}
+	});
+
+	it('takes no responsible hold on a blob its own read brought here when it has no room', async () => {
+		// The reader repair is the one path that would make a full node fuller WITHOUT writing a byte: the
+		// blob is already here under the fetch's `cached` hold, and the `responsible` hold would move it
+		// out of the reach of the cache enforcement the same `refusing` sample triggers. So it reads the
+		// same answer the announcement door reads, and the two cannot disagree about taking a hold.
+		//
+		// The node WITH room is the control: it proves the repair really ran to its write in this harness,
+		// so the refusing case is the guard's doing and not a repair that never got that far.
+		const cases: readonly { what: string; refusing: boolean; scope: BlobScope | undefined }[] = [
+			{ what: 'a node with room keeps what it read', refusing: false, scope: REGISTERED },
+			{ what: 'a node with no room takes no hold', refusing: true, scope: undefined },
+		];
+		for (const { what, refusing, scope } of cases) {
+			const { receiver, local, ref } = await receiverOver({
+				hold: 'eager',
+				cohort: [SELF],
+				storagePressure: { refusingNewData: () => refusing },
+			});
+
+			receiver.keepAfterRead(ref);
+			await tick();
+
+			expect(await local.responsibleScope(ref), what).to.equal(scope);
 		}
 	});
 
