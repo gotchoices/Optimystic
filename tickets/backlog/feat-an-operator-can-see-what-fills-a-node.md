@@ -34,3 +34,7 @@ The report is an attribution, not a measurement: files are shared between blobs 
 ## Not in scope
 
 Acting on any of it. Shedding, deleting or refusing when a node is over its allotment is `a-node-stays-within-its-allotment`.
+
+## Arm: the pressure stage belongs in the same report
+
+`a-node-stays-within-its-allotment` gives a node one named reading of how full it is — a stage, from one set of thresholds its operator configures, that decides whether the node is evicting, shedding, deleting or refusing (`StoragePressure` in `packages/db-p2p/src/storage/storage-pressure.ts`). An operator reading a breakdown of what fills a node wants the stage beside it: the four figures say what the bytes are, and the stage says what the node is doing about them. It costs nothing to add — the stage is the last sample, read synchronously with no measurement of its own.
