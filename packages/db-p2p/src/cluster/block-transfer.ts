@@ -517,7 +517,8 @@ export class BlockTransferCoordinator {
 						// sourcing exists to prevent. The earliest read is the most conservative revision still
 						// available, and recording a revision that is too OLD can only make the sweep decline
 						// (bytes kept, block re-offered by the next pass), never delete a replica this node has
-						// accepted. Do not "simplify" this to the last read.
+						// accepted. Do not "simplify" this to the last read — `test/block-transfer.spec.ts`
+						// ("reports the revision the first attempt read") fails if you do.
 						revRead = true;
 						confirmedRev = outcome.latest?.rev;
 					}

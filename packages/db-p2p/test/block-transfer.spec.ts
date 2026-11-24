@@ -17,6 +17,8 @@ const makeBlock = (id: string): IBlock => ({
 
 class MockRepo implements IRepo {
 	blocks: Map<string, IBlock> = new Map();
+	/** The committed `latest` every held block reads as. Mutable so a test can land a write mid-confirm. */
+	latestRev = 1;
 
 	async get(blockGets: BlockGets): Promise<GetBlockResults> {
 		const result: GetBlockResults = {};
@@ -25,7 +27,7 @@ class MockRepo implements IRepo {
 			if (block) {
 				result[blockId] = {
 					block,
-					state: { latest: { rev: 1, actionId: 'a1' } }
+					state: { latest: { rev: this.latestRev, actionId: 'a1' } }
 				} as any;
 			}
 		}
@@ -255,6 +257,9 @@ describe('BlockTransferCoordinator', () => {
 
 			expect(result.confirmed).to.deep.equal(['block-1']);
 			expect(result.unconfirmed).to.deep.equal([]);
+			// The revision the released-block ledger records, which is why the confirm reports it at all:
+			// sourced here because only this step runs before the release it is describing.
+			expect([...result.confirmedRevs], 'the confirm reports the revision it handed over').to.deep.equal([['block-1', 1]]);
 		});
 
 		it('carries the source revision metadata on every confirming push', async () => {
@@ -283,6 +288,7 @@ describe('BlockTransferCoordinator', () => {
 
 			expect(result.confirmed).to.deep.equal([]);
 			expect(result.unconfirmed).to.deep.equal(['block-1']);
+			expect(result.confirmedRevs.size, 'an unconfirmed block is not released, so no revision is reported').to.equal(0);
 		});
 
 		it('leaves every block unconfirmed during a detected partition (no release)', async () => {
@@ -299,6 +305,36 @@ describe('BlockTransferCoordinator', () => {
 
 			expect(result.confirmed).to.deep.equal([]);
 			expect(result.unconfirmed).to.deep.equal(['block-1']);
+		});
+
+		/**
+		 * Ticket: bug-a-replica-pushed-back-during-a-release-can-still-be-deleted. The capture is the
+		 * FIRST attempt's revision, deliberately not the confirming round's: a write landing between two
+		 * attempts — a replica a peer pushed back among them — reported as the revision handed over would
+		 * make the sweep's written-again check compare the block against itself and delete it. Pinned
+		 * because the only thing otherwise holding the ordering is a comment, and the ring-shift spec
+		 * stubs this primitive out.
+		 */
+		it('reports the revision the first attempt read, not one that landed before a later attempt confirmed', async () => {
+			repo.blocks.set('block-1', makeBlock('block-1'));
+			const o1 = (await makePeerId()).toString();
+			peerNetwork.responses.set(o1, { accepted: ['block-1'], missing: [] });
+			const realConnect = peerNetwork.connect.bind(peerNetwork);
+			let dials = 0;
+			peerNetwork.connect = async (peerId, protocol) => {
+				// Round one has already read rev 1 by the time it dials; rev 2 lands before round two reads.
+				if (++dials === 1) {
+					repo.latestRev = 2;
+					throw new Error('Connection failed');
+				}
+				return realConnect(peerId, protocol);
+			};
+
+			const result = await coordinator.confirmReplicated(['block-1'], new Map([['block-1', [o1]]]), 1);
+
+			expect(result.confirmed, 'the retry met the floor').to.deep.equal(['block-1']);
+			expect(result.confirmedRevs.get('block-1'), 'the revision the first attempt handed over, not the one that landed after it')
+				.to.equal(1);
 		});
 
 		it('leaves a block unconfirmed when it has no qualifying owners', async () => {
