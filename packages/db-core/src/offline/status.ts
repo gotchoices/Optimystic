@@ -17,8 +17,9 @@ import type { Lane } from '../lane/lane.js';
 export type QueuedFailureReason = 'constraint' | 'concurrent-modification' | 'rejected' | 'too-large' | 'expired' | 'discarded';
 
 /** What an entry still queued is waiting on: an earlier entry (the drain is strictly first in,
- * first out), the cohort (the reachability gate said no, or the last attempt could not reach it),
- * or the backoff timer after a transient failure. `undefined` for a head about to be submitted. */
+ * first out), the cohort (the reachability gate said no, the last attempt could not reach it, or it
+ * answered that it has no room left — `lastError` is what tells those apart), or the backoff timer
+ * after a transient failure. `undefined` for a head about to be submitted. */
 export type EntryWaitingFor = 'earlier-entry' | 'cohort' | 'backoff';
 
 /** What a committed entry did to the rows it wrote (docs/offline-sync.md §Guards that make idempotent

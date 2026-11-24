@@ -13,6 +13,7 @@
 
 import { expect } from 'chai';
 import {
+	CohortOutOfSpaceError,
 	CoordinatorPartialCommitError,
 	EntryNotDiscardableError,
 	Log,
@@ -50,6 +51,7 @@ import {
 import {
 	DelegatingTransactor,
 	GatedCommitTransactor,
+	RefusesPendsAsOutOfSpace,
 	RefusesPendsAsShortfall,
 	TailLandsButReportsStale,
 	TestTransactor,
@@ -513,6 +515,29 @@ describe('OfflineQueue', function () {
 		expect(throwing.pends[0]!.actionId).to.equal(throwing.pends[1]!.actionId);
 		expect(await committedKeys(inner, USERS)).to.deep.equal([[5], [1], [2]]);
 		await second.queue.dispose();
+	});
+
+	// The filed symptom of the out-of-space arm was the health counter, not the sort: `applyFailure`
+	// could name the class and still count it unclassified, which only this layer can see.
+	it('a cohort with no room left leaves the entry queued waiting for the cohort, NOT counted unclassified', async () => {
+		const inner = new TestTransactor();
+		await seed(inner, USERS);
+		const full = new RefusesPendsAsOutOfSpace(inner);
+		const { queue, statuses } = openQueue();
+		const users = await openTree(full, queue, USERS);
+		await queueEntry(queue, 'E1', [users, [[1, entry(1, 'one')]]]);
+		await waitFor(() => statuses.some(s => s.kind === 'queued' && s.entryId === 'E1' && s.waitingFor === 'cohort'),
+			{ description: 'E1 reported waiting for the cohort after the out-of-space refusal' });
+		const waiting = asQueued(statuses.find(s => s.kind === 'queued' && s.entryId === 'E1' && s.waitingFor === 'cohort'), 'the waiting status');
+		expect(waiting.lastError, 'the refusal naming the full members is what the application reads').to.be.instanceOf(CohortOutOfSpaceError);
+		expect(queue.queueState().unclassifiedFailures, 'a full cohort is classified').to.equal(0);
+
+		full.refusing = false;
+		queue.wake();
+		await queue.whenDrained();
+		expect(kindsOf(statuses, 'E1').at(-1)).to.equal('committed');
+		expect(queue.queueState().unclassifiedFailures, 'and was never counted on the way to committing').to.equal(0);
+		await queue.dispose();
 	});
 
 	it('a journal whose write-ahead throws keeps the entry queued with nothing sent and NOT in doubt, so it can still be discarded; whenDrained waits for that discard\'s removal', async () => {

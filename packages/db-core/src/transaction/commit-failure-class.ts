@@ -99,6 +99,12 @@ export function classifyCommitFailure(error: unknown): CommitFailureClass {
 		return { kind: 'cohort-unreachable', error };
 	}
 	if (error instanceof BlockUnavailableError) {
+		// NOTE: a read doubt sorts as `unknown`, which the drain counts in
+		// `OfflineQueueState.unclassifiedFailures` — a reading documented as zero in a correct
+		// deployment, though a doubt about one block's currency can be transient rather than a fault.
+		// The same holds for `BlockPossiblyStaleError`, excused in `commit-failure-class.spec.ts`'s
+		// UNSORTED for being a read's answer. Unseen so far; if `offline:unclassified-failure` is ever
+		// seen naming either, give read doubts a class of their own rather than leaving them here.
 		return isCohortUnreachableRead(error)
 			? { kind: 'cohort-unreachable', error }
 			: { kind: 'unknown', error };

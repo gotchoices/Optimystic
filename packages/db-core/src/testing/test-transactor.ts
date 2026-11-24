@@ -1,4 +1,4 @@
-import type { ITransactor, GetBlockResults, ActionBlocks, ActionLineage, BlockLineage, BlockActionStatus, PendResult, CommitResult, PendRequest, BlockId, CommitRequest, BlockGets, IBlock, ActionId, ActionRev, ActionTransforms, StaleFailure, Transform, Transforms, ClusterNomineesResult, CollectionId } from "../index.js";
+import type { ITransactor, GetBlockResults, ActionBlocks, ActionLineage, BlockLineage, BlockActionStatus, PendResult, CommitResult, PendRequest, BlockId, CommitRequest, BlockGets, IBlock, ActionId, ActionRev, ActionTransforms, StaleFailure, WriteFailure, Transform, Transforms, ClusterNomineesResult, CollectionId } from "../index.js";
 import { highestStaleAt, isOwnRevision } from "../network/stale-failure.js";
 import { localDurability } from "../network/durability.js";
 import { ensuredMap } from "../utility/ensured.js";
@@ -681,13 +681,12 @@ export class TailLandsButReportsStale extends DelegatingTransactor {
 }
 
 /**
- * Answers every pend with a promise shortfall — the cohort's silence, in the shape
- * `CoordinatorRepo.pend` returns it — and delegates nothing, so nothing is reserved and nothing
- * lands. For the write paths' "stopped by name" cases: a shortfall is not a conflict a retry can
- * win, so one attempt is made and `PromiseShortfallError` escapes with every staged action still
- * staged.
+ * Answers every pend with one refusal in the shape `CoordinatorRepo.pend` returns it, and delegates
+ * nothing, so nothing is reserved and nothing lands. For the write paths' "stopped by name" cases:
+ * none of these refusals is a conflict a retry can win, so one attempt is made and the refusal's own
+ * error escapes with every staged action still staged.
  */
-export class RefusesPendsAsShortfall extends DelegatingTransactor {
+abstract class RefusesPends extends DelegatingTransactor {
 	/** Pends refused so far. */
 	pends = 0;
 	/** While `true` every pend is refused; set `false` to let pends through again — the cohort back
@@ -698,14 +697,38 @@ export class RefusesPendsAsShortfall extends DelegatingTransactor {
 		super(inner);
 	}
 
+	/** The refusal every pend is answered with. */
+	protected abstract refusal(): WriteFailure;
+
 	override async pend(request: PendRequest): Promise<PendResult> {
 		if (!this.refusing) return this.inner.pend(request);
 		this.pends++;
+		return this.refusal();
+	}
+}
+
+/** Answers every pend with a promise shortfall — the cohort's silence — so a write path raises
+ *  `PromiseShortfallError`. */
+export class RefusesPendsAsShortfall extends RefusesPends {
+	protected override refusal(): WriteFailure {
 		return {
 			success: false,
 			conflict: false,
 			reason: 'Failed to get super-majority: injected shortfall',
 			shortfall: { approvals: 1, rejections: 0, peerCount: 3, needed: 3, silentPeers: ['peer-b', 'peer-c'] },
+		};
+	}
+}
+
+/** Answers every pend with a cohort that has no room left — the members answered, and refused for
+ *  want of storage — so a write path raises `CohortOutOfSpaceError`. */
+export class RefusesPendsAsOutOfSpace extends RefusesPends {
+	protected override refusal(): WriteFailure {
+		return {
+			success: false,
+			conflict: false,
+			reason: 'Cohort is out of space: injected',
+			outOfSpace: { peerIds: ['peer-b', 'peer-c'], approvals: 1, peerCount: 3, needed: 3 },
 		};
 	}
 }
