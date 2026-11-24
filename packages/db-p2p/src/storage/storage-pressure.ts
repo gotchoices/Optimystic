@@ -104,6 +104,14 @@ export function ownWriteRoomOf(capacity: StorageCapacity): OwnWriteRoom {
  * `NOTE:` above for the backstop block pends do NOT get. Everybody else's pend is refused once the
  * last pressure sample read `refusing`.
  *
+ * **`ownWrite` means written AND coordinated here.** Both gates learn it from the writer's in-process
+ * mark (`MessageOptions.localWriter`), which the writer's transactor sets only on the request it hands
+ * to its own node — so the exemption covers a pend this node coordinates, and the member's vote
+ * reaches it only through the in-process pre-vote (`ClusterCoordinator.prevoteLocalPromise`). A write
+ * of this node's own program that a PEER coordinates arrives at this member over the wire with nothing
+ * to distinguish it, and meets the gate at `refuseAbove` like anybody else's. See
+ * `tickets/backlog/bug-a-full-nodes-own-write-is-still-refused-when-a-peer-coordinates-it.md`.
+ *
  * An absent gate — a member or repo built by hand, a node with no account — refuses nothing, which is
  * also what a node that cannot measure its storage answers.
  */

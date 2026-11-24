@@ -222,10 +222,9 @@ function signedValidity({ computedHash }: ValidityRejection): ValidityRejection 
  * boolean because every signature it threads through reads better for saying what the value MEANS,
  * and because the default is the one that refuses: a record off the wire is always `'elsewhere'`.
  *
- * `'this-process'` reaches a member by ONE path — {@link ClusterMember.updateFromLocalWriter}, which
- * only this node's own coordinator calls in process — and is what exempts the host's own write from
- * the space gate (`refusesPendForSpace`). It is never part of a {@link ClusterRecord}: not signed,
- * not hashed, not sent, so no remote writer can claim it.
+ * `'this-process'` reaches a member by ONE path — {@link ClusterMember.updateFromLocalWriter}, whose
+ * doc comment carries the whole argument — and is what exempts the host's own write from the space
+ * gate (`refusesPendForSpace`).
  */
 type RecordWriter = 'this-process' | 'elsewhere';
 
@@ -870,11 +869,17 @@ export class ClusterMember implements ICluster {
 	 * the bytes a remote member receives are byte-identical to before and a remote writer has nothing
 	 * to forge.
 	 *
-	 * The pre-vote is the FIRST delivery of every record this node coordinates, and a member votes only
-	 * on a record that is not yet decided and carries no vote of its own
-	 * ({@link getTransactionPhase}) — so every later delivery of such a record here (the commit round,
-	 * the consensus broadcast, a carried owed record) already carries this member's vote or is already
-	 * decided, and never re-votes without the fact.
+	 * No later delivery of the same record re-votes on it WITHOUT the fact, on two counts: a member
+	 * votes only on a record that is not yet decided and carries no vote of its own
+	 * ({@link getTransactionPhase}), and the promise round asks this node's member exactly once —
+	 * `ClusterCoordinator.prevoteLocalPromise` returns an outcome whether the member voted or threw, so
+	 * the round leaves self out either way. The commit round, the consensus broadcast and a carried
+	 * owed record all deliver a record that is already decided or already carries this member's vote.
+	 *
+	 * Reached only when this node BOTH wrote and coordinates the pend, since the pre-vote is the one
+	 * caller. A write of this node's own program that a peer coordinates reaches this member through
+	 * {@link update} and is refused for space like anybody else's — the boundary is argued at
+	 * `refusesPendForSpace`.
 	 */
 	async updateFromLocalWriter(record: ClusterRecord): Promise<ClusterRecord> {
 		return await this.updateFrom(record, 'this-process');
@@ -2151,11 +2156,10 @@ export class ClusterMember implements ICluster {
 		// cannot measure its storage, or has taken no sample yet, answers `false` and refuses nothing.
 		//
 		// Through `refusesPendForSpace` rather than reading the gate directly, because that predicate is
-		// also what the cohort-of-one refusal reads (`CoordinatorRepo.refuseSoloPendForSpace`) and the
-		// two must not drift about whose write the reserved headroom is for — which they did, until a
-		// write this node's own program made was accepted when this node was the whole cohort and
-		// refused when it was one of three. A pend the program in THIS process wrote is exempt; a pend
-		// from any other writer still meets the gate at `refuseAbove`, here and on every other member.
+		// also what the cohort-of-one refusal reads (`CoordinatorRepo.refuseSoloPendForSpace`), and the
+		// two drifting about whose write the reserved headroom is for was itself the defect. That
+		// predicate is where the own-write exemption and its boundary are argued; `writer` is how this
+		// gate learns which kind of write it has ({@link updateFromLocalWriter}).
 		if (sawPend && refusesPendForSpace(this.storagePressure, writer === 'this-process')) {
 			return {
 				valid: false,

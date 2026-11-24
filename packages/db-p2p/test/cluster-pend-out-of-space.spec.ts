@@ -12,7 +12,7 @@
  * cohort of three or fewer members at the default super-majority, so a single member's "not right now"
  * expressed as a `reject` becomes a permanent `ValidatorRejectionError` for the whole transaction.
  *
- * Four claims, over the three tiers where they are observable:
+ * Five claims, over the four tiers where they are observable:
  *  - the member signs `out-of-space` (and only for a pend it would otherwise have APPROVED: a stale
  *    revision still wins, permanently, and a member with room still approves);
  *  - the member's own recomputed phase is the terminal-but-retryable one, not `Rejected`;

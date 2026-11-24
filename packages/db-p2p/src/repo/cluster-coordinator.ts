@@ -393,11 +393,11 @@ export class ClusterCoordinator {
 		private readonly localCluster?: {
 			update: (record: ClusterRecord) => Promise<ClusterRecord>;
 			/**
-			 * {@link update} for a record whose pend the program in THIS process wrote; see
-			 * ClusterMember.updateFromLocalWriter. Called by {@link prevoteLocalPromise} alone, and only
-			 * for a write marked `MessageOptions.localWriter` — the fact never rides on the record, so
-			 * nothing a remote writer sends can reach it. Optional like its siblings: absent on a bare
-			 * `ICluster` double, and the pre-vote then calls {@link update}, exactly as before.
+			 * {@link update} for a record whose pend the program in THIS process wrote, which the space
+			 * gate exempts; the shape and why it is a separate method are argued at
+			 * `ClusterMember.updateFromLocalWriter`. Called by {@link prevoteLocalPromise} alone.
+			 * Optional like its siblings: absent on a bare `ICluster` double, and the pre-vote then
+			 * calls {@link update}, exactly as before.
 			 */
 			updateFromLocalWriter?: (record: ClusterRecord) => Promise<ClusterRecord>;
 			peerId: PeerId;
@@ -1026,9 +1026,9 @@ export class ClusterCoordinator {
 
 		// Create a new pending transaction. `localWriter` is set only by a transactor in this process
 		// (`NetworkTransactor`) and never travels on the wire, so it is this node's one honest answer to
-		// "is this pend our own program's write" — which is what exempts it from the space gate on this
-		// node's own member, as it already does on a cohort of one. It is read here and threaded down to
-		// the pre-vote rather than put anywhere near the record: no field of `ClusterRecord` carries it.
+		// "is this pend our own program's write" — which is what exempts it from the space gate
+		// (`refusesPendForSpace`). Threaded down to the pre-vote rather than put anywhere near the
+		// record: no field of `ClusterRecord` carries it.
 		const localWriter = options?.localWriter === true;
 		const transactionPromise = this.executeTransaction(peers, record, localWriter);
 		const pending = new Pending(transactionPromise);
@@ -1545,11 +1545,10 @@ export class ClusterCoordinator {
 		try {
 			// A copy, so the member cannot mutate the record the fan-out is about to send.
 			//
-			// This call — an in-process one, to this node's own member — is the ONLY way the fact that
-			// the pend came from the program on this machine reaches a promise vote. It rides the call
-			// rather than the record for the reason the mark itself never travels: a remote writer must
-			// not be able to claim the host's own reserved headroom. A member built as a bare `ICluster`
-			// double has no such entry point and is asked exactly as before.
+			// This call is the ONLY way the fact that the pend came from the program on this machine
+			// reaches a promise vote — so the exemption covers a write this node coordinates and no
+			// other (`refusesPendForSpace`, which argues that boundary). A member built as a bare
+			// `ICluster` double has no such entry point and is asked exactly as before.
 			const member = this.localCluster!;
 			const response = localWriter && member.updateFromLocalWriter
 				? await member.updateFromLocalWriter({ ...record })
