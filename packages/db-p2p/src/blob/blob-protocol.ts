@@ -43,7 +43,12 @@ export type BlobRequest =
 
 /** What the responder holds of one blob: all of it, some of its pieces, or none. */
 export type BlobLocalHolding = 'whole' | 'partial' | 'none';
-export type BlobAnnounceAnswer = 'whole' | 'fetching' | 'declined' | 'not-responsible' | 'unreferenced';
+/**
+ * What a node answers an announcement with. `declined` is a CONFIGURATION — an `on-demand` node will
+ * never hold the blob — while `out-of-space` is a CONDITION that clears, which is why the two are read
+ * differently by every announcer (`SATISFYING_ANSWERS` in `blob/cohort-reaction.ts`).
+ */
+export type BlobAnnounceAnswer = 'whole' | 'fetching' | 'declined' | 'out-of-space' | 'not-responsible' | 'unreferenced';
 export type BlobRefusalReason = 'busy' | 'malformed';
 
 /** First frame the responder sends. */
@@ -140,7 +145,14 @@ export function checkAnswerFits(request: BlobRequest, answer: BlobAnswer, peer: 
 }
 
 const HOLDINGS: readonly BlobLocalHolding[] = ['whole', 'partial', 'none'];
-const ANNOUNCE_ANSWERS: readonly BlobAnnounceAnswer[] = ['whole', 'fetching', 'declined', 'not-responsible', 'unreferenced'];
+// A value added to BlobAnnounceAnswer and NOT added here is not a type error, and the symptom is on
+// the reading side: this list is what `decodeBlobAnswer` checks, so an answer missing from it reads as
+// a protocol break and resets the stream. Adding it is therefore not optional.
+// NOTE: the converse is a version skew nothing here can fix — a peer on a build whose list lacks
+// `out-of-space` reads that answer as a break and treats the announcement as unreachable, i.e. asks
+// again later, which is the same thing it does with a dropped stream. Only a receiver on a NEW build
+// sends it, so no old-to-old exchange is affected.
+const ANNOUNCE_ANSWERS: readonly BlobAnnounceAnswer[] = ['whole', 'fetching', 'declined', 'out-of-space', 'not-responsible', 'unreferenced'];
 const REFUSAL_REASONS: readonly BlobRefusalReason[] = ['busy', 'malformed'];
 
 /** A decoded header: its kind, and every field it carried. Fields the kind does not name are ignored. */

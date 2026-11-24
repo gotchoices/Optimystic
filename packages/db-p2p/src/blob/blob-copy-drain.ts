@@ -356,11 +356,13 @@ export class BlobCopyDrain implements Startable {
 			if (this.noteAnswer(peerId, entry.ref, answer)) {
 				confirmed.push(peerId);
 			}
-			// `not-responsible` and `unreferenced` are both "ask again": the first means the two
-			// machines' views of the cohort differ for now, the second that the peer has not seen the
-			// commit or could not read it. Counted under the give-up rule so a peer that always says so
-			// is dropped for this blob until it reconnects.
-			if (answer === 'not-responsible' || answer === 'unreferenced') {
+			// `not-responsible`, `unreferenced` and `out-of-space` are all "ask again": the first means the
+			// two machines' views of the cohort differ for now, the second that the peer has not seen the
+			// commit or could not read it, the third that the peer has no room at the moment. Counted
+			// under the give-up rule so a peer that always says so is dropped for this blob until it
+			// reconnects — which is exactly how an unreachable peer is treated, and is why nothing
+			// remembers "full" per peer the way `declined` is remembered.
+			if (answer === 'not-responsible' || answer === 'unreferenced' || answer === 'out-of-space') {
 				context.noteFailure(peerId);
 			} else {
 				context.noteSuccess(peerId);

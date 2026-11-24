@@ -89,7 +89,7 @@ import { ReleasedBlockSweep } from './storage/released-block-sweep.js';
 import { DEFAULT_MIN_RING_CAPACITY_BYTES, MAX_RING_DEPTH, RingSelector } from './storage/ring-selector.js';
 import { RingShiftCoordinator } from './storage/ring-shift-coordinator.js';
 import { cacheBudgetBytes, StorageAccount } from './storage/storage-account.js';
-import { resolveStoragePressureThresholds, StoragePressure } from './storage/storage-pressure.js';
+import { resolveStoragePressureThresholds, StoragePressure, type OwnWriteRoom } from './storage/storage-pressure.js';
 import type { StorageAllotmentOptions, StorageCapacity } from './storage/storage-account.js';
 import { ArachnodeFretAdapter } from './storage/arachnode-fret-adapter.js';
 import type { RestoreCallback, BlockArchive } from './storage/struct.js';
@@ -1277,7 +1277,9 @@ function storageProtocolServices(
 	options: NodeOptions,
 	superMajorityThreshold: number,
 	inboundAuthorization: InboundStreamAuthorizationInit,
-	liveNode: () => Libp2p | undefined
+	liveNode: () => Libp2p | undefined,
+	/** The node's one reading of how full it is; the block-transfer handler refuses pushes on it. */
+	storagePressure: StoragePressure
 ): NonNullable<Libp2pInit['services']> {
 	const protocolPrefix = `/optimystic/${options.networkName}`;
 	return {
@@ -1372,7 +1374,11 @@ function storageProtocolServices(
 				// A received replica is a block this node now holds, and its sender demonstrably holds
 				// it too — without this the next rebalance check pushes the copy straight back to the
 				// sender and pulls it again over `/sync`.
-				onBlockHolders: serving.onBlockHolders
+				onBlockHolders: serving.onBlockHolders,
+				// The first of the three doors a full node closes (`packages/db-p2p/docs/storage.md`
+				// §10): a node at `refusing` answers every pushed block `missing` with `outOfSpace`,
+				// before spending any CPU on the proofs it would otherwise verify.
+				storagePressure
 			});
 		}
 	};
@@ -1418,7 +1424,20 @@ export async function createLibp2pNodeBase(
 	// only copy until its reference commits, and a client is often that machine (docs/blobs.md §The
 	// node's blob service). Started once the node has, below, where `node.blobs` is built over it.
 	const pieceStore = nodeStorage.pieces;
-	const blobs = new LocalBlobService({ pieces: pieceStore, kv: kvStore, digest: options.blobs?.digest });
+	// `ownWriteRoom` is the third of the doors a full node closes (`packages/db-p2p/docs/storage.md`
+	// §10), and the only one at the whole allotment rather than at `refuseAbove`: it refuses the HOST's
+	// own `put` and `pin` — `node.blobs` delegates both here — which is the last thing a node gives up.
+	//
+	// A closure over `storagePressure`, built below, because the account that measures this disk reads
+	// these blob records (through its own `blobRecords` thunk) and the reading reads that account, so
+	// one of the three has to be reached late. A `put` or `pin` before the first sample has room, as a
+	// node that cannot measure itself always does.
+	const blobs = new LocalBlobService({
+		pieces: pieceStore, kv: kvStore, digest: options.blobs?.digest,
+		// Return type annotated, not inferred: `blobs` → this thunk → `storagePressure` → `storageAccount`
+		// → its own `blobRecords` thunk → `blobs` is a type cycle TypeScript cannot resolve on its own.
+		ownWriteRoom: (): OwnWriteRoom => storagePressure.ownWriteRoom()
+	});
 	// Read here, before the blob protocol service entry below closes over it: an on-demand node declines
 	// every announcement, including the ones that arrive before the receiver exists.
 	const blobHold: BlobHoldPolicy = options.blobs?.hold ?? 'eager';
@@ -1681,7 +1700,7 @@ export async function createLibp2pNodeBase(
 
 			// The four storage protocol services, registered only by a node that stores blocks: their
 			// absence from a client's identify list is what keeps it out of every cohort.
-			...(serving ? storageProtocolServices(serving, options, consensusConfig.superMajorityThreshold, inboundAuthorization, () => liveNode) : {}),
+			...(serving ? storageProtocolServices(serving, options, consensusConfig.superMajorityThreshold, inboundAuthorization, () => liveNode, storagePressure) : {}),
 
 			// The blob protocol, on both roles and gated like the storage protocols: a client holds the
 			// blobs its own host put, and until a row referencing one commits it holds the only copy, so
@@ -2118,6 +2137,9 @@ export async function createLibp2pNodeBase(
 			local: blobs,
 			fetcher: blobTransfer.fetcher,
 			client: blobTransfer.client,
+			// The second of the three doors a full node closes (`packages/db-p2p/docs/storage.md` §10): a
+			// node at `refusing` answers `out-of-space` rather than taking a new `responsible` hold.
+			storagePressure,
 			// Both ends abort a blob stream that moves no bytes for one response timeout, and nothing moves
 			// while the receiver reads committed state; the other half of the timeout is for the answer frame.
 			answerWithinMs: linkDeadlines.responseTimeoutMs / 2,

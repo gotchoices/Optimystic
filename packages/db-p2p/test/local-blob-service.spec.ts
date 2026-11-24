@@ -9,6 +9,7 @@ import type { IPieceStore } from '../src/blob/piece-store.js';
 import { MAX_BLOB_SCOPE_CHARS } from '../src/protocol-limits.js';
 import type { IKVStore } from '../src/storage/i-kv-store.js';
 import { MemoryKVStore } from '../src/storage/memory-kv-store.js';
+import { NodeOutOfSpaceError, type OwnWriteRoom } from '../src/storage/storage-pressure.js';
 import { PowerLossKVStore } from '../src/testing/power-loss-kv-store.js';
 import { PowerLossPieceStore } from '../src/testing/power-loss-piece-store.js';
 
@@ -17,6 +18,11 @@ const PIECE = 256 * 1024;
 /** A service whose scheduled sweeps never fire, so every sweep in a test is the one it calls. */
 function serviceOver(pieces: IPieceStore, kv: IKVStore): LocalBlobService {
 	return new LocalBlobService({ pieces, kv, setTimer: () => () => undefined });
+}
+
+/** A service whose pressure reading answers `room`, with sweeps that never fire as above. */
+function serviceWithRoom(pieces: IPieceStore, kv: IKVStore, room: OwnWriteRoom): LocalBlobService {
+	return new LocalBlobService({ pieces, kv, setTimer: () => () => undefined, ownWriteRoom: () => room });
 }
 
 /** Deterministic bytes that differ by `seed`. */
@@ -521,6 +527,32 @@ describe('LocalBlobService', () => {
 		expect(await collect(service.listPins('unstaged:'))).to.deep.equal([{ ref, owner: 'unstaged:1' }]);
 		// No prefix is every pin, and the unreadable record is skipped rather than failing the pass.
 		expect(await collect(service.listPins(''))).to.have.length(3);
+	});
+
+	it('a put on a node with no room writes no piece and no record, and never reads the source', async () => {
+		// The refusal has to land BEFORE anything is staged: one after three pieces leaves three pieces
+		// behind, which is invisible in the error and costs a sweep. So this asserts the piece store and
+		// the record store are untouched AND that the source was never pulled — the blob is never even
+		// hashed, so there is nothing to clean up and nothing was read off the host's stream.
+		const pieces = new MemoryPieceStore();
+		const kv = new MemoryKVStore();
+		const service = serviceWithRoom(pieces, kv, { hasRoom: false, usedBytes: 2048, totalBytes: 2048 });
+		const content = bytesOf(600 * 1024, 31);
+		let chunksRead = 0;
+		async function* counted(): AsyncIterable<Uint8Array> {
+			chunksRead++;
+			yield content;
+		}
+
+		const refused = await service.put(counted()).then(() => undefined, (error: unknown) => error);
+
+		expect(refused).to.be.instanceOf(NodeOutOfSpaceError);
+		expect(refused).to.include({ usedBytes: 2048, totalBytes: 2048 });
+		expect(chunksRead, 'the source was pulled').to.equal(0);
+		expect(await listed(pieces)).to.deep.equal([]);
+		expect(await kv.list(BLOB_RECORD_KEY_PREFIX)).to.deep.equal([]);
+		// And the same reading leaves every read path alone: a full node still serves what it holds.
+		expect(await service.stat(await refOf(content))).to.deep.include({ locality: 'unknown' });
 	});
 
 	it('a malformed record stops the sweep', async () => {

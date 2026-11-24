@@ -48,6 +48,61 @@ export function atLeastPressure(stage: StoragePressureStage, atLeast: StoragePre
 }
 
 /**
+ * Whether the node has room for the HOST's own writes, and what it measured when it has not. The
+ * second question this reading answers, beside the stage.
+ *
+ * The host's own writes are refused LATER than everybody else's: not at `refuseAbove`, where the
+ * three inbound doors refuse, but only once the measured use has reached the effective total. A
+ * node's own writes are the work it exists to do and the last thing it should give up; the replicas
+ * and blobs it holds on the network's behalf are the giveable part. The gap between `refuseAbove` and
+ * the allotment is the headroom this uses — the same headroom that covers pends already approved and
+ * the sampling window.
+ */
+export type OwnWriteRoom =
+	| { readonly hasRoom: true }
+	| {
+		readonly hasRoom: false;
+		/** What was measured, as {@link StorageCapacity.usedBytes} reports it (unclamped). */
+		readonly usedBytes: number;
+		/** The effective total the use reached: the smaller of the allotment and the disk. */
+		readonly totalBytes: number;
+	};
+
+/**
+ * {@link OwnWriteRoom} from one capacity. Pure, and the one place the host's own limit is compared
+ * against a measurement. An absent `totalBytes` — the node cannot measure its storage — answers room,
+ * which is the whole of what an unmeasurable node does.
+ */
+export function ownWriteRoomOf(capacity: StorageCapacity): OwnWriteRoom {
+	const { totalBytes, usedBytes } = capacity;
+	if (totalBytes === undefined || usedBytes < totalBytes) {
+		return { hasRoom: true };
+	}
+	return { hasRoom: false, usedBytes, totalBytes };
+}
+
+/**
+ * The host asked this node to store something and it has no room left: thrown by
+ * `LocalBlobService.put` and `.pin` before anything is staged, so a refused put leaves no pieces
+ * behind and no sweep to run. Typed, and exported from `@optimystic/db-p2p`, so a host catches it
+ * rather than matching on a message.
+ *
+ * Refused at the effective total rather than at `refuseAbove` — see {@link OwnWriteRoom} for why the
+ * host's own writes are the last thing a node gives up.
+ */
+export class NodeOutOfSpaceError extends Error {
+	constructor(
+		/** What this node had measured as used when it refused. */
+		readonly usedBytes: number,
+		/** The effective total that use had reached. */
+		readonly totalBytes: number
+	) {
+		super(`node is out of space: ${usedBytes} of ${totalBytes} bytes used`);
+		this.name = 'NodeOutOfSpaceError';
+	}
+}
+
+/**
  * The fractions of the effective total at which a node changes what it does.
  * `NodeOptions.storageAllotment.thresholds`.
  *
@@ -193,12 +248,18 @@ export function pressureStageOf(capacity: StorageCapacity, thresholds: StoragePr
 }
 
 /**
- * The node's pressure reading: one sample per tick, one stage, and a synchronous accessor for the
+ * The node's pressure reading: one sample per tick, one stage, and synchronous accessors for the
  * inbound paths that must not block on a disk scan.
  *
  * The difference between the two reads is load-bearing. {@link read} asks the account (one memoized
- * `capacity()` call) and answers a fresh stage; {@link stage} answers the LAST stage read, with no
- * I/O at all, which is what a push handler, an announce handler or a promise vote reads.
+ * `capacity()` call) and answers a fresh stage; {@link stage}, {@link refusingNewData} and
+ * {@link ownWriteRoom} answer the LAST sample, with no I/O at all, which is what a push handler, an
+ * announce handler or a promise vote reads.
+ *
+ * It answers two questions, at two different limits. {@link refusingNewData} is "does this node take
+ * data from other machines", at `refuseAbove`; {@link ownWriteRoom} is "has it room for the host's own
+ * writes at all", at the effective total. A node gives up what it holds on the network's behalf before
+ * it gives up the work it exists to do.
  */
 export class StoragePressure {
 	private readonly account: Pick<StorageAccount, 'capacity'>;
@@ -211,6 +272,12 @@ export class StoragePressure {
 	private readonly log: Logger;
 	/** The last stage MEASURED. `unknown` until the first successful read, so a node refuses nothing until it has measured itself once. */
 	private lastStage: StoragePressureStage = 'unknown';
+	/**
+	 * The capacity the last SUCCESSFUL scan measured, absent until there has been one. Kept across a
+	 * failed scan for the reason {@link lastStage} is: one storage fault must not change what the gates
+	 * read. {@link ownWriteRoom} is derived from it.
+	 */
+	private lastCapacity: StorageCapacity | undefined;
 	/** Whether a read has ever succeeded; the first one logs its stage even when that stage is `unknown`. */
 	private measured = false;
 	/** The read in flight, absent while none runs — so one tick's sample and a consumer's `read()` share one scan. */
@@ -243,6 +310,27 @@ export class StoragePressure {
 	 */
 	stage(): StoragePressureStage {
 		return this.lastStage;
+	}
+
+	/**
+	 * Whether this node refuses new data from OTHER machines: the last sample read `refusing`. The one
+	 * question the refusal doors ask — a pushed replica, an announced blob, a cohort member's promise
+	 * vote — so no door re-derives it from {@link stage} and its own threshold comparison.
+	 *
+	 * `false` on a node that cannot measure itself (`unknown` sits below every acting stage) and
+	 * `false` before the first successful read, so such a node refuses nothing.
+	 */
+	refusingNewData(): boolean {
+		return atLeastPressure(this.lastStage, 'refusing');
+	}
+
+	/**
+	 * Whether this node has room for the HOST's own writes, from the last sample — {@link OwnWriteRoom},
+	 * which is also where the different limit is argued. Room before the first successful read and on a
+	 * node that cannot measure itself, so such a node refuses nothing.
+	 */
+	ownWriteRoom(): OwnWriteRoom {
+		return this.lastCapacity === undefined ? { hasRoom: true } : ownWriteRoomOf(this.lastCapacity);
 	}
 
 	/**
@@ -321,6 +409,7 @@ export class StoragePressure {
 		}
 		this.measured = true;
 		this.lastStage = stage;
+		this.lastCapacity = capacity;
 		if (atLeastPressure(stage, 'shedding')) {
 			this.requestSheddingReactions(stage);
 		}

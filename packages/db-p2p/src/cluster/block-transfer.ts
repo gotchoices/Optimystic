@@ -13,6 +13,12 @@ function logRefusals(path: 'push' | 'confirm', blockId: string, refusals: readon
 	for (const refusal of refusals) {
 		if (refusal.reason === 'unreachable') {
 			log('%s:peer-error block=%s peer=%s err=%s', path, blockId, refusal.peerId, refusal.error);
+		} else if (refusal.reason === 'out-of-space') {
+			// Its own line, which is the whole of what the lost-block confirm path gains from the new
+			// answer: a full peer was ALREADY not counted as a holder and the range was already retained,
+			// but an operator reading a handoff that will not confirm could not tell new owners that are
+			// full from ones that are unreachable or lack the proof.
+			log('%s:peer-full block=%s peer=%s (receiver is out of space; nothing verified or persisted)', path, blockId, refusal.peerId);
 		} else {
 			log('%s:peer-rejected block=%s peer=%s (receiver did not persist)', path, blockId, refusal.peerId);
 		}
@@ -51,9 +57,11 @@ export interface RebalanceReactionResult {
 	/** Grown blocks confirmed pushed to every newly co-responsible peer (capped by the floor). */
 	replicated: string[];
 	/**
-	 * Grown blocks that could not be confirmed on the new peers this pass. Nothing is released off
-	 * this list — the node keeps the block either way. The retry lives in the monitor: the caller
-	 * feeds each block's {@link GrowthOutcome} (in `growth`) back via
+	 * Grown blocks whose new peers were not all confirmed satisfied this pass — either the floor was
+	 * not reached, or one of them answered that it is out of space (which is reported incomplete even
+	 * when the floor WAS reached; see {@link BlockTransferCoordinator.replicateGrown}). Nothing is
+	 * released off this list — the node keeps the block either way. The retry lives in the monitor: the
+	 * caller feeds each block's {@link GrowthOutcome} (in `growth`) back via
 	 * `RebalanceMonitor.recordGrowthOutcome`, so an unconfirmed peer stays out of the seen set and
 	 * the next check re-detects it.
 	 */
@@ -204,12 +212,19 @@ export class BlockTransferCoordinator {
 	 * {@link confirmReplicated}); the growth arm as a whole is gated by the `rebalance.enabled`
 	 * wiring in `libp2p-node-base`.
 	 *
-	 * Per-block {@link GrowthOutcome} rules:
+	 * Per-block {@link GrowthOutcome} rules, in the order they are applied:
+	 * - any reported peer out of space → only the peers that actually confirmed, incomplete. Checked
+	 *   FIRST, ahead of the floor: a full peer holds nothing, and recording it satisfied would enter it
+	 *   in `RebalanceMonitor`'s seen set, which only a departure from the cohort clears — so the block
+	 *   would never be offered to it again even once it has room.
 	 * - floor met → all reported peers satisfied, complete. Deliberately includes peers
 	 *   `executeConfirm` skipped once the floor was reached — the block is adequately replicated,
 	 *   and re-pushing the remainder on every check forever would be a live loop.
 	 * - no local data → all reported peers satisfied, complete (nothing to replicate; see NOTE).
 	 * - otherwise → only the peers that actually confirmed, incomplete (retried by the monitor).
+	 *
+	 * A peer that answers out of space is also not pushed to again for the rest of this pass — across
+	 * the other blocks and their retry rounds — which is what the one `fullPeers` set per call is for.
 	 */
 	private async replicateGrown(
 		grown: Map<string, string[]>,
@@ -221,6 +236,12 @@ export class BlockTransferCoordinator {
 		if (grown.size === 0) {
 			return { confirmed, unconfirmed, growth };
 		}
+		/**
+		 * The peers that answered out of space during THIS pass, shared across its blocks and their
+		 * retry rounds. One set per call is what makes the memory last exactly one pass: nothing carries
+		 * it to the next check, so a peer whose room came back is asked again then.
+		 */
+		const fullPeers = new Set<string>();
 
 		if (this.partitionDetector.detectPartition()) {
 			// Mirrors confirmReplicated's guard (replicateGrown drives executeConfirm directly). An
@@ -240,10 +261,21 @@ export class BlockTransferCoordinator {
 			const result = await this.executeConfirm(
 				blockId,
 				new Map([[blockId, newPeers]]),
-				Math.min(floor, newPeers.length) // both ≥ 1 here: the caller clamps floor, empty newPeers returned above
+				Math.min(floor, newPeers.length), // both ≥ 1 here: the caller clamps floor, empty newPeers returned above
+				fullPeers
 			);
 			if (result === null) return; // confirm already in flight — no information, no entry
-			if (result.confirmed) {
+			// Read after the confirm, so it includes peers a CONCURRENT block's push found full. That is
+			// deliberate: the peer is full either way, and one pass should reach one verdict about it.
+			const full = newPeers.filter(peerId => fullPeers.has(peerId));
+			if (full.length > 0) {
+				// Ahead of the floor-met branch: see the per-block rules above. Incomplete counts an
+				// attempt, so the monitor re-detects the block on its next check and gives up on the peer
+				// after `growthMaxAttempts` — which a departure from the cohort then clears.
+				log('grow:out-of-space block=%s peers=%d/%d', blockId, full.length, newPeers.length);
+				unconfirmed.push(blockId);
+				growth.set(blockId, { satisfiedPeers: [...result.confirmedPeers], complete: false });
+			} else if (result.confirmed) {
 				confirmed.push(blockId);
 				growth.set(blockId, { satisfiedPeers: [...newPeers], complete: true });
 			} else if (result.noLocalData) {
@@ -276,6 +308,11 @@ export class BlockTransferCoordinator {
 	 * and the caller keeps serving it. Per-block timeout + retry mirror {@link pushBlocks}. During a
 	 * detected partition every block is left unconfirmed (consistent with the push guard), so a partition
 	 * mid-handoff aborts rather than releases.
+	 *
+	 * A new owner that answers {@link BlockTransferResponse.outOfSpace} was already not counted as a
+	 * holder, so the block was already retained; what the answer adds is that it is logged as
+	 * `confirm:peer-full` rather than as an owner that did not have the block, so an operator reading a
+	 * handoff that will not confirm can tell new owners that are FULL from ones that are unreachable.
 	 *
 	 * @param owners  blockId → candidate owner peer ids. The caller MUST have already excluded self and
 	 *   any same-range mover (a peer shedding the same sub-range), so every id here is a qualifying holder.
@@ -382,11 +419,18 @@ export class BlockTransferCoordinator {
 	 * replica even if a later round missed it — the floor decision itself stays per-round, unchanged);
 	 * `noLocalData` marks the nothing-local-to-push case. The lost-block release path uses only
 	 * `confirmed`; the growth arm consumes the other two.
+	 *
+	 * `fullPeers`, when given, is the caller's pass-scoped memory of peers that answered out of space:
+	 * such a peer is not pushed to again in any later round here, and a peer that answers it is added.
+	 * {@link confirmReplicated} passes none — a shed range is already retained when a new owner does not
+	 * confirm, so the two or three extra round trips to a full owner buy a real chance that one of them
+	 * has room by the last round, which is worth more there than the round trips cost.
 	 */
 	private async executeConfirm(
 		blockId: string,
 		owners: Map<string, string[]>,
-		floor: number
+		floor: number,
+		fullPeers?: Set<string>
 	): Promise<{ confirmed: boolean; confirmedPeers: Set<string>; noLocalData: boolean } | null> {
 		const key = `confirm:${blockId}`;
 		if (this.inFlight.has(key)) return null;
@@ -407,7 +451,7 @@ export class BlockTransferCoordinator {
 					// The shared read-certify-push loop, once per attempt, stopping once `floor` DISTINCT
 					// owners hold a current replica. A confirming holder either takes a certified replica
 					// or reports the block missing (see executePush).
-					const outcome = await this.pushBlock(blockId, candidateOwners, floor);
+					const outcome = await this.pushBlock(blockId, candidateOwners, floor, fullPeers);
 					if (outcome.status !== 'pushed') {
 						// No local bytes to prove replication with — cannot confirm; keep serving. An
 						// `unavailable` read (this node could not find out what it holds) is folded in
@@ -434,6 +478,13 @@ export class BlockTransferCoordinator {
 					log('confirm:ok block=%s holders=%d/%d', blockId, confirmCount, floor);
 					return { confirmed: true, confirmedPeers: allConfirmedPeers, noLocalData: false };
 				}
+				if (fullPeers !== undefined && candidateOwners.every(peerId => fullPeers.has(peerId))) {
+					// Every candidate answered out of space, so a retry would push to nobody — it would only
+					// sleep out the backoff and report the same thing. The caller reads `fullPeers` itself to
+					// decide what to report for the block.
+					log('confirm:all-full block=%s owners=%d', blockId, candidateOwners.length);
+					return { confirmed: false, confirmedPeers: allConfirmedPeers, noLocalData: false };
+				}
 				if (attempt < this.maxRetries) {
 					log('confirm:retry block=%s holders=%d/%d attempt=%d', blockId, confirmCount, floor, attempt + 1);
 					await this.delay(this.backoffMs(attempt));
@@ -451,13 +502,16 @@ export class BlockTransferCoordinator {
 	 * This coordinator's binding of the shared push loop: rebalance reason, this node's protocol
 	 * prefix, and `transferTimeoutMs` as BOTH per-peer deadlines (see {@link BlockTransferConfig}).
 	 */
-	private pushBlock(blockId: string, peerIds: readonly string[], stopAfterConfirmed: number): Promise<PushBlockOutcome> {
+	private pushBlock(
+		blockId: string, peerIds: readonly string[], stopAfterConfirmed: number, fullPeers?: Set<string>
+	): Promise<PushBlockOutcome> {
 		return pushBlockToPeers(this.repo, this.peerNetwork, blockId, peerIds, {
 			reason: 'rebalance',
 			protocolPrefix: this.protocolPrefix,
 			stopAfterConfirmed,
 			dialTimeoutMs: this.transferTimeoutMs,
-			responseTimeoutMs: this.transferTimeoutMs
+			responseTimeoutMs: this.transferTimeoutMs,
+			...(fullPeers ? { fullPeers } : {})
 		});
 	}
 

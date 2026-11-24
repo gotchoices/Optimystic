@@ -24,6 +24,7 @@ import {
 } from '@optimystic/db-core';
 import { createLogger } from '../logger.js';
 import type { IKVStore } from '../storage/i-kv-store.js';
+import { NodeOutOfSpaceError, type OwnWriteRoom } from '../storage/storage-pressure.js';
 import { armUnrefTimer } from '../unref-timer.js';
 import { blobScopeProblem } from './blob-protocol.js';
 import { BlobRecordFormatError, DEFAULT_BLOB_OWNER, type BlobHold, type BlobHoldKind, type BlobRecord } from './blob-record.js';
@@ -272,6 +273,16 @@ export interface LocalBlobServiceInit {
 	readonly now?: () => number;
 	/** Default armUnrefTimer. */
 	readonly setTimer?: (fn: () => void, ms: number) => () => void;
+	/**
+	 * Whether this node has room for the host's own writes (`StoragePressure.ownWriteRoom`), read on
+	 * every {@link LocalBlobService.put} and {@link LocalBlobService.pin}. Absent — a service built
+	 * without a pressure reading, as `SingleMachineBlobService` builds one — refuses nothing.
+	 *
+	 * A THUNK for the reason `StorageAllotmentOptions.blobRecords` is one: the node builds this service
+	 * before the account that measures its disk, and that account reads these records back, so one of
+	 * the two must be reached late. Read, not captured, on every write.
+	 */
+	readonly ownWriteRoom?: () => OwnWriteRoom;
 }
 
 /**
@@ -297,6 +308,8 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobRespo
 	private readonly sweepDelayMs: number;
 	private readonly now: () => number;
 	private readonly setTimer: (fn: () => void, ms: number) => () => void;
+	/** See {@link LocalBlobServiceInit.ownWriteRoom}; defaulted here so no write path branches on absence. */
+	private readonly ownWriteRoom: () => OwnWriteRoom;
 	private cancelScheduledSweep: (() => void) | undefined;
 	/** A sweep whose timer has fired, until it ends. */
 	private scheduledRun: Promise<void> | undefined;
@@ -315,6 +328,7 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobRespo
 		this.sweepDelayMs = init.sweepDelayMs ?? DEFAULT_SWEEP_DELAY_MS;
 		this.now = init.now ?? Date.now;
 		this.setTimer = init.setTimer ?? armUnrefTimer;
+		this.ownWriteRoom = init.ownWriteRoom ?? (() => ({ hasRoom: true }));
 		this.sweeper = new PieceSweeper({ pieces: this.pieces, records: this.records, gate: this.gate, inProgress: this.inProgress, digest: this.digest, inUseRefs: () => this.inUseRefs() });
 		this.fetchDoor = {
 			source: this.source,
@@ -394,10 +408,14 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobRespo
 	 * empty owner throws RangeError). Resolves once every piece and the record naming them are
 	 * durable here, in that order. Two concurrent puts of one content store one set of pieces and
 	 * leave one record with both pins.
+	 *
+	 * Throws {@link NodeOutOfSpaceError} on a node with no room left, BEFORE the first piece is
+	 * written — so a refused put leaves no pieces behind and no sweep to run.
 	 */
 	async put(source: AsyncIterable<Uint8Array>, options: BlobPutOptions = {}): Promise<BlobPutResult> {
 		const owner = options.owner ?? DEFAULT_BLOB_OWNER;
 		assertOwner(owner);
+		this.requireRoomForOwnWrite('put');
 		const mine = new Set<PieceId>();
 		try {
 			const result = await buildBlob(source, this.sinkFor(mine), { digest: this.digest, signal: options.signal });
@@ -511,9 +529,15 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobRespo
 	/**
 	 * Holds the blob for `owner` (an empty owner throws RangeError), creating its record when there is
 	 * none, and makes the pin durable: a lost pin would let a restart sweep the blob.
+	 *
+	 * Throws {@link NodeOutOfSpaceError} on a node with no room left, even when the blob is already
+	 * whole here and the pin would take no new bytes. That is the accepted sharp edge (docs/blobs.md
+	 * §Holds): a pin is a promise to keep bytes this node has no room to keep, and the alternative is a
+	 * `stat` on the hot path of a gate.
 	 */
 	async pin(ref: BlobRef, owner: string): Promise<void> {
 		assertOwner(owner);
+		this.requireRoomForOwnWrite('pin');
 		const at = this.now();
 		await this.changeRecord(ref, current => recordAfterPin(current, ref, owner, at));
 		await this.records.flush();
@@ -960,6 +984,20 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobRespo
 			heldBytes = size ?? 0;
 		}
 		return { size, heldBytes, whole };
+	}
+
+	/**
+	 * Refuse a write of the host's own if this node has no room for it. The ONE place the host's limit
+	 * is applied, read from the node's pressure reading rather than measured here: a write path must
+	 * not block on a directory walk.
+	 */
+	private requireRoomForOwnWrite(path: 'put' | 'pin'): void {
+		const room = this.ownWriteRoom();
+		if (room.hasRoom) {
+			return;
+		}
+		log('%s:out-of-space usedBytes=%d totalBytes=%d', path, room.usedBytes, room.totalBytes);
+		throw new NodeOutOfSpaceError(room.usedBytes, room.totalBytes);
 	}
 
 	/** Arms the sweep timer unless it is already armed. A timer firing during a run sweeps again after it. */

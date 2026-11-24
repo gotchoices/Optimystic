@@ -15,6 +15,7 @@ import { servableProof, type ArchiveServingRepo } from '../storage/block-archive
 import type { BlockHoldersSink } from './cluster-repo.js';
 import { peerProofMemoryFor } from './peer-proof-memory.js';
 import { registerProtocolHandler } from '../network/register-protocol-handler.js';
+import type { StoragePressure } from '../storage/storage-pressure.js';
 
 const log = createLogger('block-transfer-service');
 
@@ -219,6 +220,16 @@ export interface BlockTransferResponse {
 	 * uncertified), so a sender must read this list independently of `missing`.
 	 */
 	unresolvedProofs?: string[];
+	/**
+	 * Present and `true` when THIS RECEIVER has no room: it refused the whole request on storage
+	 * grounds, before verifying any proof and without persisting anything, and every id in
+	 * {@link missing} is missing for that reason alone.
+	 *
+	 * A property of the receiver rather than of a block, so it rides once per response rather than per
+	 * block id. A sender on a build that does not know this field reads the answer exactly as it reads
+	 * one today — every block `missing` — so it is additive on the wire.
+	 */
+	outOfSpace?: true;
 }
 
 // --- Service (server-side handler) ---
@@ -307,6 +318,16 @@ export interface BlockTransferServiceComponents {
 	 * working; absent, `handlePush` behaves exactly as it did without it.
 	 */
 	onBlockHolders?: BlockHoldersSink;
+	/**
+	 * How full this node is (`packages/db-p2p/docs/storage.md` §10). A node at `refusing` answers every
+	 * pushed block {@link BlockTransferResponse.missing} with
+	 * {@link BlockTransferResponse.outOfSpace}, before any verification.
+	 *
+	 * Optional so a directly-constructed service (tests, an embedder wiring only the protocol) keeps
+	 * working; absent, nothing refuses — which is also what a node that cannot measure its own storage
+	 * does.
+	 */
+	storagePressure?: Pick<StoragePressure, 'refusingNewData'>;
 }
 
 /**
@@ -326,6 +347,8 @@ export class BlockTransferService implements Startable {
 	private readonly requirePushCertificate: boolean;
 	/** See {@link BlockTransferServiceComponents.onBlockHolders}. */
 	private readonly onBlockHolders: BlockHoldersSink | undefined;
+	/** See {@link BlockTransferServiceComponents.storagePressure}. */
+	private readonly storagePressure: Pick<StoragePressure, 'refusingNewData'> | undefined;
 
 	constructor(
 		components: BlockTransferServiceComponents,
@@ -337,6 +360,7 @@ export class BlockTransferService implements Startable {
 		this.proofThresholds = proofThresholds(components.superMajorityThreshold);
 		this.requirePushCertificate = init.requirePushCertificate ?? true;
 		this.onBlockHolders = components.onBlockHolders;
+		this.storagePressure = components.storagePressure;
 		// Denials are errors, so they go to this module's own `:error` child channel rather than its
 		// main one — visible under `optimystic:db-p2p:block-transfer-service:*`, not under an exact
 		// match on `optimystic:db-p2p:block-transfer-service` alone.
@@ -447,12 +471,30 @@ export class BlockTransferService implements Startable {
 	 * `saveReplicatedBlock` finding the pushed revision already held, so no collection change fires —
 	 * is reported like any other: the sender is a holder either way, and the block may already be
 	 * tracked from an earlier route.
+	 *
+	 * **A node with no room refuses the whole request first,** on storage grounds and before anything
+	 * else — see {@link BlockTransferServiceComponents.storagePressure}.
 	 */
 	private async handlePush(request: BlockTransferRequest, senderPeerId?: string): Promise<BlockTransferResponse> {
 		const accepted: string[] = [];
 		const missing: string[] = [];
 		/** Deduplicated: several blocks of one commit reference one hash. */
 		const unresolvedProofs = new Set<string>();
+
+		// Ahead of validation AND certification on purpose: a node that is going to refuse this request
+		// should not first spend CPU on signatures it will refuse anyway (the NOTE below on the
+		// unbounded per-request verification cost). Nothing was persisted and nothing was certified, so
+		// every requested id is reported `missing`, as it is for a fault — a sender that does not read
+		// `outOfSpace` behaves exactly as it does today.
+		//
+		// `unresolvedProofs` is deliberately omitted even for a request that carried `proofRefs`: this
+		// node did not look any of them up, so claiming either that they resolved or that they did not
+		// would be a statement it has not made. The sender reads `outOfSpace` first and leaves its proof
+		// memory for this peer untouched (`pushBlockToPeers`).
+		if (this.storagePressure?.refusingNewData() === true) {
+			log('push:out-of-space blocks=%d reason=%s (refused before verification)', request.blockIds.length, request.reason);
+			return { accepted: [], missing: request.blockIds, outOfSpace: true };
+		}
 
 		if (!request.blocks) {
 			return { accepted: [], missing: request.blockIds };
@@ -679,8 +721,11 @@ export type PushRefusal = {
 	 * `rejected`: the peer ANSWERED and listed the block as missing — it did not persist it
 	 * (uncertified under its `requirePushCertificate`, unparseable, or a persist fault; the receiver
 	 * logs which). `unreachable`: the push threw — a dial failure, a deadline, a stream error.
+	 * `out-of-space`: the peer answered {@link BlockTransferResponse.outOfSpace} — it has no room and
+	 * refused the request whole, without verifying or persisting anything. The last is a condition that
+	 * clears, so a sender retries it later rather than treating the peer as a non-holder for good.
 	 */
-	reason: 'rejected' | 'unreachable';
+	reason: 'rejected' | 'unreachable' | 'out-of-space';
 	/** The thrown error's message, for `unreachable`. */
 	error?: string;
 };
@@ -707,7 +752,10 @@ export type PushBlockOutcome =
 		/** Peers that hold the block now: each answered without listing it as missing. */
 		confirmed: string[];
 		refusals: PushRefusal[];
-		/** Peers not pushed to because {@link PushBlockOptions.stopAfterConfirmed} was reached first. */
+		/**
+		 * Peers not pushed to at all: {@link PushBlockOptions.stopAfterConfirmed} was reached first, or
+		 * {@link PushBlockOptions.fullPeers} already held the peer from an earlier push in this pass.
+		 */
 		skipped: string[];
 	};
 
@@ -722,6 +770,16 @@ export interface PushBlockOptions {
 	/** Per-peer deadlines forwarded to {@link BlockTransferClient.pushBlocks}; omitted = uncapped. */
 	dialTimeoutMs?: number;
 	responseTimeoutMs?: number;
+	/**
+	 * Peers known to have no room: read before pushing (such a peer is reported `skipped`, never pushed
+	 * to again) and ADDED TO as peers answer {@link BlockTransferResponse.outOfSpace}.
+	 *
+	 * The CALLER owns the set, which is what makes "for the rest of the pass" mean the caller's pass
+	 * rather than one block's: `BlockTransferCoordinator.replicateGrown` keeps one per reaction, so a
+	 * peer found full while pushing one block is not pushed to again for the others nor on their retry
+	 * rounds. Omitted = no memory, and every peer is pushed to as before.
+	 */
+	fullPeers?: Set<string>;
 }
 
 /**
@@ -752,7 +810,9 @@ function proofReference(
  * way that is true — a peer holds the block only when its response does NOT list the block as
  * missing, because `handlePush` omits a block from `missing` only after persisting it (or already
  * holding that revision). A round trip that returns is not a landed replica; a round trip that
- * throws is not a refusal.
+ * throws is not a refusal. A receiver that answers {@link BlockTransferResponse.outOfSpace} refused
+ * the whole request on storage grounds, so its refusal is reported with that reason rather than as a
+ * rejection of this block, and {@link PushBlockOptions.fullPeers} is how a caller stops asking it.
  *
  * This is the whole read-certify-push-interpret sequence every sender runs — the rebalance
  * handoff and confirm (`BlockTransferCoordinator`), spread-on-churn, and the under-replication
@@ -830,6 +890,11 @@ export async function pushBlockToPeers(
 		// the cost of serializing concurrent pushes of a commit behind its first block.
 		if (shownProofs.holds(peerIdStr, reference.hash)) {
 			const named = await client.pushBlocks(blocks, reason, reference.push, deadlines);
+			// A receiver with no room refused before looking at any reference, so its answer says nothing
+			// about whether it can resolve this one. Returned as it is: re-pushing the proof inline would
+			// be a second request to a peer that just refused, and forgetting the memory would cost a
+			// round trip on every later block once the peer has room again.
+			if (named.outOfSpace) return named;
 			// Keyed off `unresolvedProofs` and never off `missing`, so a lenient receiver that took the
 			// block uncertified still gets the proof, which `StorageRepo.saveReplicatedBlock` back-fills
 			// onto the revision it just landed. An answer with no `unresolvedProofs` at all comes from a
@@ -856,9 +921,19 @@ export async function pushBlockToPeers(
 			skipped.push(peerIdStr);
 			continue;
 		}
+		// A peer that already said it has no room gets no second request this pass. Reported `skipped`
+		// rather than refused again: it is a peer this call did not ask, and the refusal it answered
+		// earlier is already in the caller's `fullPeers`.
+		if (options.fullPeers?.has(peerIdStr)) {
+			skipped.push(peerIdStr);
+			continue;
+		}
 		try {
 			const response = await pushToPeer(peerIdStr);
-			if (response.missing.includes(blockId)) {
+			if (response.outOfSpace) {
+				options.fullPeers?.add(peerIdStr);
+				refusals.push({ peerId: peerIdStr, reason: 'out-of-space' });
+			} else if (response.missing.includes(blockId)) {
 				refusals.push({ peerId: peerIdStr, reason: 'rejected' });
 			} else {
 				confirmed.push(peerIdStr);

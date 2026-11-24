@@ -19,6 +19,7 @@ import type { BlobAnnounceAnswer } from './blob-protocol.js';
 import type { BlobProtocolClient } from './blob-protocol-client.js';
 import type { LocalBlobService } from './local-blob-service.js';
 import type { BlobReferenceCheck, ReferenceVerdict } from './reference-check.js';
+import type { StoragePressure } from '../storage/storage-pressure.js';
 
 const log = createLogger('blob:protocol');
 
@@ -35,6 +36,12 @@ export interface BlobAnnounceReceiverDeps {
 	local: Pick<LocalBlobService, 'stat' | 'holdResponsible' | 'responsibleScope' | 'responsibleRefs'>;
 	fetcher: Pick<BlobFetcher, 'start'>;
 	client: Pick<BlobProtocolClient, 'held'>;
+	/**
+	 * How full this node is (`packages/db-p2p/docs/storage.md` §10). A node at `refusing` answers
+	 * `out-of-space` rather than taking a new `responsible` hold. Absent — a receiver built without a
+	 * pressure reading — refuses nothing, which is also what a node that cannot measure itself does.
+	 */
+	storagePressure?: Pick<StoragePressure, 'refusingNewData'>;
 	/** How long `decide` may spend reading committed state before it answers `unreferenced`: half the node's `responseTimeoutMs`. */
 	answerWithinMs: number;
 	/** Default Date.now. */
@@ -124,7 +131,7 @@ export class BlobAnnounceReceiver {
 		this.stopped = true;
 	}
 
-	/** The decision, in the order docs/blobs.md §Who may fetch and who may store sets out: nothing is read before it must be. */
+	/** The decision, in the order docs/blobs.md §Who may fetch and who may store sets out: nothing is read before it must be, and the storage refusal sits above the one read this makes. */
 	private async decided(announcer: string, ref: BlobRef, scope: BlobScope, startedAt: number): Promise<BlobAnnounceAnswer> {
 		if (this.deps.hold === 'on-demand') {
 			return 'declined';
@@ -142,6 +149,15 @@ export class BlobAnnounceReceiver {
 		if (!this.deps.limiter.admit(announcer)) {
 			log('announce:limited peer=%s ref=%s', announcer, ref);
 			return 'unreferenced';
+		}
+		// Before the reference read on purpose: that read is the expensive part of answering an
+		// announcement — it holds one of the node's four reference-read slots — and a node that is not
+		// going to take the blob either way should not spend a slot establishing that it is referenced.
+		// Deliberately NOT a satisfying answer to the announcer (`SATISFYING_ANSWERS` in
+		// `cohort-reaction.ts`): being full is a condition that clears, so the announcer asks again.
+		if (this.deps.storagePressure?.refusingNewData() === true) {
+			log('announce:out-of-space peer=%s ref=%s', announcer, ref);
+			return 'out-of-space';
 		}
 		const verdict = await this.referenced(ref, scope, startedAt);
 		if ('ranLate' in verdict) {

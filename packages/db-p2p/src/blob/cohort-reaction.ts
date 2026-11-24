@@ -40,6 +40,20 @@ const REACTION_CONCURRENCY = 4;
  * restart (`BlobAnnounceReceiver.resume`); its `held`, when it comes, reaches the monitor as holder
  * evidence through the drain's `onHolderConfirmed`. `declined` counts because a node that declines
  * will never hold the blob, so counting it owed would keep this node's hold for ever.
+ *
+ * `out-of-space` is deliberately NOT here, and the asymmetry with `declined` is the whole reason:
+ * `declined` is a permanent fact about a CONFIGURATION, while being full is a CONDITION that clears.
+ * A satisfied peer enters `RebalanceMonitor`'s seen set, which only a departure from the cohort
+ * clears — so counting a full peer satisfied would mean never offering it that blob again. It is
+ * treated as an unreachable peer instead: unsatisfied, so the growth outcome is incomplete and the
+ * monitor retries it (bounded by `growthMaxAttempts`), and remembered nowhere per peer, since a
+ * memory of "full" would need a clock to expire it and the passes are already the retry.
+ *
+ * The RELEASE arm reads none of this and must not: an out-of-space candidate stays in both the
+ * numerator and the denominator of the release count, its `stat` does not answer `whole`, and so the
+ * reference is retained. Dropping it from the count (the `satisfiedWithoutRequest` treatment) would
+ * LOWER the number of holders a release needs and let this node drop a hold because its neighbours
+ * are full.
  */
 const SATISFYING_ANSWERS: readonly BlobAnnounceAnswer[] = ['whole', 'fetching', 'declined'];
 
