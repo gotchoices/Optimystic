@@ -910,11 +910,15 @@ function formatBytes(bytes: number): string {
  * network a slice of a disk needs to be told.
  *
  * Costs the account's first scan, which the memo then serves to ring selection for the next minute.
- * A scan that REJECTS is reported and swallowed: this line is a report, and failing node
- * construction over it would make an unreadable directory fatal to a node that may never read it (a
- * client's block store).
+ * So it returns BEFORE scanning when nothing is listening — alone among the start-up lines, which
+ * are otherwise unconditional because they cost nothing to format. A scan that REJECTS is reported
+ * and swallowed: this line is a report, and failing node construction over it would make an
+ * unreadable directory fatal to a node that may never read it (a client's block store).
  */
 async function logStorageAllotment(account: StorageAccount): Promise<void> {
+	if (!wiringLog.enabled) {
+		return;
+	}
 	let capacity: StorageCapacity;
 	try {
 		capacity = await account.capacity();
@@ -935,10 +939,15 @@ async function logStorageAllotment(account: StorageAccount): Promise<void> {
 		: `this location holds ${formatBytes(locationBytes)} in all`;
 	wiringLog('storage allotment: %s; %s — so this node may use %s, of which %s is used',
 		allotmentClause, locationClause, formatBytes(totalBytes), formatBytes(usedBytes));
-	// Said separately because it is a different fact: such a node is below the floor for serving ANY
-	// ring, so it will hold nothing for the network however much of its allotment is free.
+	// Said separately because it is a different fact: ring selection will not size such a node from
+	// its storage at all.
+	// NOTE: it says what the node DOES, which is not what it should do. `determineRing` answers -1
+	// below this floor and `createArachnodeInfo` clamps that to ring 0 with no partition, so the node
+	// that can serve least advertises the whole keyspace. Do not make this line claim the node serves
+	// nothing until that is true; the fix belongs with the work that makes a node act on its
+	// allotment, which owns `determineRing`'s answer below the floor.
 	if (allotmentBytes !== undefined && allotmentBytes < DEFAULT_MIN_RING_CAPACITY_BYTES) {
-		wiringLog('storage allotment: %s is below the %s a node needs to serve any ring, so this node will serve no part of the keyspace',
+		wiringLog('storage allotment: %s is below the %s ring selection needs before it will size this node from its storage, so no ring is chosen from the allotment and the node advertises ring 0 (the whole keyspace) regardless. Raise the allotment if you meant this node to serve a slice of the keyspace.',
 			formatBytes(allotmentBytes), formatBytes(DEFAULT_MIN_RING_CAPACITY_BYTES));
 	}
 }
@@ -1372,10 +1381,11 @@ export async function createLibp2pNodeBase(
 	const storageAccount = new StorageAccount(nodeStorage, options.storageAllotment);
 	// Before anything starts, beside the durability line, and awaited so an operator reading the
 	// start-up log sees the allotment next to what the node's writes survive.
-	// NOTE: this makes every node construction wait on one block-store scan — a directory walk on a
-	// file host. A serving node already paid it inside `createArachnodeInfo`; a client node did not.
-	// If a host ever reports a slow start over a very large store, log the line from a void promise
-	// instead of awaiting it, or seed it from the first ring-selection scan.
+	// NOTE: with `node-wiring` logging ON this makes node construction wait on one block-store scan —
+	// a directory walk on a file host. A serving node already paid it inside `createArachnodeInfo`; a
+	// client node did not. (With logging off the line scans nothing; see `logStorageAllotment`.) If a
+	// host ever reports a slow start over a very large store, log the line from a void promise instead
+	// of awaiting it, or seed it from the first ring-selection scan.
 	await logStorageAllotment(storageAccount);
 	// Bound after libp2p has started, below, since the receiver needs the node's key network and fetcher
 	// while the service entry is built before them.
@@ -3465,7 +3475,18 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 			// disabled stays at its bootstrap ring rather than flipping unsafely.
 			const monitorInterval = setInterval(async () => {
 				if (!ringShift) return;
-				const transition = await ringSelector.shouldTransition();
+				// Caught here rather than left to reject: the decision's first act is to measure the
+				// node's storage, and a backend whose scan throws (a directory walk over a tree a
+				// permission change made unreadable) would otherwise reject this async interval
+				// callback with nothing to catch it — an unhandled rejection, process-fatal on Node
+				// >= 15. Ring shifting is a resilience optimization: skip the tick and try the next.
+				let transition: Awaited<ReturnType<typeof ringSelector.shouldTransition>>;
+				try {
+					transition = await ringSelector.shouldTransition();
+				} catch (err) {
+					log('Ring transition check failed, skipping this tick: %o', err);
+					return;
+				}
 				if (transition.shouldMove && transition.direction && transition.newRingDepth !== undefined) {
 					log('Ring transition needed: moving %s to Ring %d', transition.direction, transition.newRingDepth);
 					try {

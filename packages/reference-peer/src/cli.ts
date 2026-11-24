@@ -70,8 +70,11 @@ class PeerSession {
 	private parseStorageAllotment(options: { storageAllotment?: string }): number | undefined {
 		if (!options.storageAllotment) return undefined;
 		const parsed = Number(options.storageAllotment);
-		if (!Number.isFinite(parsed) || parsed <= 0) {
-			throw new Error('--storage-allotment must be a positive number of bytes');
+		// The same rule `NodeOptions.storageAllotment.bytes` is held to, checked here so a mistyped
+		// figure is refused by the flag that took it rather than by a RangeError out of node
+		// construction after the stores are already open.
+		if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+			throw new Error('--storage-allotment must be a whole positive number of bytes');
 		}
 		return parsed;
 	}
@@ -209,8 +212,14 @@ class PeerSession {
 		}
 		// The account's own figures, not the flag that was typed: an allotment larger than the disk is
 		// bounded by the disk, and a node with neither an allotment nor a free-space figure has no
-		// total at all — both of which an operator can only see from here.
-		logDebug('storage account', await node.storageAccount.capacity());
+		// total at all — both of which an operator can only see from here. Reported, never thrown:
+		// measuring costs a store scan that can fail, and this whole method is a status line on the
+		// start-up path — the peer must still come up.
+		try {
+			logDebug('storage account', await node.storageAccount.capacity());
+		} catch (err) {
+			logDebug('storage account unavailable (measuring this node\'s storage failed)', err);
+		}
 	}
 
 	private async ensureDiary(name: string): Promise<Diary<any>> {

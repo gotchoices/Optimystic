@@ -26,8 +26,9 @@ describe('ArachnodeFretAdapter.getRingStats', () => {
 	});
 
 	it('yields no stat for a ring where nobody advertised capacity', () => {
-		// Not a ring with avgCapacity 0, which `RingSelector.estimateNetworkData` would read as real
-		// demand; no stat at all, which falls through to its bootstrap estimate.
+		// Not a ring with `avgCapacity: 0`, which reports an observation nobody made. What
+		// `RingSelector.estimateNetworkData` then does with the empty list — its bootstrap estimate
+		// rather than the zero-aggregate fallback — is that method's business, not this one's.
 		expect(adapterOver([peer('a', { ringDepth: 3, status: 'active' })]).getRingStats()).to.deep.equal([]);
 	});
 });

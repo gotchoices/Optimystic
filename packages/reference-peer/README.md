@@ -193,7 +193,7 @@ Options:
 - `--fret-profile <profile>`: FRET profile: `edge` or `core` (default: `edge`)
 - `-s, --storage <type>`: `memory` | `file` (default: `memory`)
 - `--storage-path <path>`: Required when `--storage file`
-- `--storage-capacity <bytes>`: Override storage capacity in bytes (used for ring selection / arachnode sizing)
+- `--storage-allotment <bytes>`: How many bytes of this machine to give the network, bounded by what the disk will still hold (used for ring selection / arachnode sizing)
 - `--cluster-size <number>`: Desired cluster size per key (positive integer). Overrides the `libp2p-node-base` default (10). Must match peers in the same network — e.g. browser peers built with `clusterSize: 3` need service peers started with `--cluster-size 3`. Accepted by `interactive`, `service`, and `run`.
 - `--assumed-cluster-size <number>`: How many peers you assert this deployment genuinely runs (positive integer). This is a *different* question from `--cluster-size`, which is how many copies to keep. Two things read it, and when you leave it unset they fall back to **different** values on purpose:
   - The **membership admission gate**, only when the node has no confident network-size estimate — which is exactly what a partition causes. On that path the declared peer set must be at least 75% of this number. Unset it defaults to 2, so an unconfigured small mesh can still transact; a large deployment should set it to its real cohort size, otherwise a minority side of a partition can still assemble a write.
