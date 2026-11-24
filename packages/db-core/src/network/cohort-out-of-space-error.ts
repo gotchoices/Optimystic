@@ -21,12 +21,6 @@ import type { CohortOutOfSpace, OutOfSpaceFailure } from "./struct.js";
  * {@link OutOfSpaceFailure} ({@link toFailure}), which is what lets a remote writer receive them at
  * all; and each write path (`Collection.sync`, `TransactionCoordinator.commit`) raises it again from
  * that refusal.
- *
- * NOTE: `classifyCommitFailure` has no arm for this class, so an offline drain sorts it as `unknown`.
- * Conservative and safe — the write was never stored, and a retry under its own identity stores it
- * once — but it also raises a counter documented as zero in a correct deployment and logs the failure
- * as one nothing could name. Tracked, with the drain-behaviour decision it needs, in
- * tickets/backlog/bug-a-full-cohort-refusal-reaches-the-offline-drain-unclassified.
  */
 export class CohortOutOfSpaceError extends Error {
 	/** Peer-id strings of the cohort members that voted `out-of-space` — never empty for a refusal a

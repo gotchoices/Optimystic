@@ -867,6 +867,7 @@ export class OfflineQueue {
 	 * | the journal's write-ahead threw | `queued`, `backoff` — nothing was sent |
 	 * | `ActionRefusedError` thrown directly (the head's recorded refusal) | `failed`, `refusalReason` |
 	 * | `cohort-unreachable` | `queued`, `cohort`; the timer re-checks the gate |
+	 * | `cohort-out-of-space` | `queued`, `cohort`, logged with the full members; the timer re-checks the gate |
 	 * | `contention`, `expired`, `in-doubt`, `unknown` | `queued`, `backoff`; `unknown` is also logged and counted |
 	 * | `guard-refused`, `rejected`, `too-large` | `failed`, with the class's reason |
 	 * | `torn-not-saved` | `queued`, `backoff`; doubt cleared (unless part of the entry is committed), a fresh action id, retained attempts cleared, the drive record rewritten |
@@ -904,6 +905,17 @@ export class OfflineQueue {
 		const outcome = classifyCommitFailure(error);
 		switch (outcome.kind) {
 			case 'cohort-unreachable': {
+				this.setQueued(entry, 'cohort', error);
+				return true;
+			}
+			case 'cohort-out-of-space': {
+				// Named, not counted as unclassified: the members answered, and what clears the wait is
+				// storage rather than connectivity, so the line names who is full. `'cohort'` is the
+				// right status for that wait and changes no retry mechanics — the loop asks the gate at
+				// the top of every iteration whatever `waitingFor` says, and `'cohort'` and `'backoff'`
+				// park on the same timer.
+				log('offline:cohort-out-of-space entry=%s action=%s peers=%o approvals=%d/%d',
+					entry.id, entry.actionId, outcome.error.peerIds, outcome.error.approvals, outcome.error.needed);
 				this.setQueued(entry, 'cohort', error);
 				return true;
 			}

@@ -4,6 +4,7 @@ import { ValidityRejectedError } from "../network/validity-rejected-error.js";
 import { TransactionExpiredError } from "../network/transaction-expired-error.js";
 import { TransactionTooLargeError } from "../network/transaction-size.js";
 import { BlockTooLargeError } from "../network/block-size.js";
+import { CohortOutOfSpaceError } from "../network/cohort-out-of-space-error.js";
 import { SyncRetryExhaustedError, TornActionError } from "../collection/struct.js";
 import type { ActionRefusedError } from "../collection/struct.js";
 import { TreeEntryChangedError, TreeGuardRefusedError } from "../collections/tree/struct.js";
@@ -17,6 +18,11 @@ import { CoordinatorPartialCommitError, CoordinatorStaleLossError } from "./erro
  *
  * - `cohort-unreachable` — too few of the cohort answered, so the attempt that met it stored nothing.
  *   Wait for the cohort.
+ * - `cohort-out-of-space` — the members that sank the write have no storage left and refused to take
+ *   it, so nothing was stored. Its own arm rather than `cohort-unreachable`'s, because a full cohort
+ *   ANSWERED: a re-read and rebase sends the same bytes to the same full members, and what clears it
+ *   is those members shedding what they hold or their operator giving them more space, not
+ *   connectivity returning. Wait for the cohort.
  * - `contention` — the write lost races until its retry budget ran out and was not saved, though an
  *   earlier attempt's log entry may still stand (see {@link SyncRetryExhaustedError}). Back off.
  * - `guard-refused` — a rival's commit made the write wrong: `constraint` for a uniqueness refusal,
@@ -32,6 +38,7 @@ import { CoordinatorPartialCommitError, CoordinatorStaleLossError } from "./erro
  */
 export type CommitFailureClass =
 	| { kind: 'cohort-unreachable'; error: PromiseShortfallError | BlockUnavailableError }
+	| { kind: 'cohort-out-of-space'; error: CohortOutOfSpaceError }
 	| { kind: 'contention'; error: SyncRetryExhaustedError | CoordinatorStaleLossError }
 	| { kind: 'guard-refused'; refusal: 'constraint' | 'concurrent-modification'; error: TreeGuardRefusedError }
 	| { kind: 'rejected'; error: ValidityRejectedError }
@@ -95,6 +102,9 @@ export function classifyCommitFailure(error: unknown): CommitFailureClass {
 		return isCohortUnreachableRead(error)
 			? { kind: 'cohort-unreachable', error }
 			: { kind: 'unknown', error };
+	}
+	if (error instanceof CohortOutOfSpaceError) {
+		return { kind: 'cohort-out-of-space', error };
 	}
 	// `SyncRevisionStalledError` is a `SyncRetryExhaustedError`, so the base class covers it.
 	if (error instanceof SyncRetryExhaustedError || error instanceof CoordinatorStaleLossError) {
