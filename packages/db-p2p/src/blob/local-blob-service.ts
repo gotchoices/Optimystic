@@ -26,7 +26,7 @@ import { createLogger } from '../logger.js';
 import type { IKVStore } from '../storage/i-kv-store.js';
 import { armUnrefTimer } from '../unref-timer.js';
 import { blobScopeProblem } from './blob-protocol.js';
-import { BlobRecordFormatError, DEFAULT_BLOB_OWNER, type BlobHold, type BlobRecord } from './blob-record.js';
+import { BlobRecordFormatError, DEFAULT_BLOB_OWNER, type BlobHold, type BlobHoldKind, type BlobRecord } from './blob-record.js';
 import { BlobRecordStore, type BlobRecordChange } from './blob-record-store.js';
 import { localPieceSource } from './local-piece-source.js';
 import { InProgressPieces, PieceSweeper, type BlobSweepResult } from './piece-sweeper.js';
@@ -163,6 +163,30 @@ export interface BlobCacheRecords {
 	sweep(): Promise<BlobSweepResult>;
 }
 
+/** What one hold kind accounts for, over the blobs this node has records for. */
+export interface HoldBytes {
+	/** The sum of `BlobRecord.size` over the blobs attributed to this hold. */
+	readonly bytes: number;
+	/** How many of those blobs carry no size, and so are left out of {@link bytes}. */
+	readonly unsized: number;
+}
+
+/**
+ * What an operator's report of this node's storage needs of its blob records; `LocalBlobService` is
+ * it (`packages/db-p2p/docs/storage.md` §9).
+ *
+ * A door rather than a second `BlobRecordStore` over the same `IKVStore`, for the reason
+ * {@link BlobOwedRecords} gives: two instances keep separate per-ref queues, and a write that
+ * bypassed `changeRecord` would also bypass the sweep gate and `PieceSweeper.noteRecordChange`.
+ */
+export interface BlobByteRecords {
+	/**
+	 * One pass over every readable record, attributing each blob to the ONE hold that keeps it, by
+	 * precedence `pin > owed > responsible > cached`.
+	 */
+	bytesByHold(): Promise<Readonly<Record<BlobHoldKind, HoldBytes>>>;
+}
+
 /** What the reclaim pass knows about one blob this node holds because it is responsible for it. */
 export interface ResponsibleMark {
 	readonly ref: BlobRef;
@@ -258,10 +282,11 @@ export interface LocalBlobServiceInit {
  * asks another machine. It owns the records the copy drain changes and the `onDurability` listeners it
  * emits through ({@link BlobOwedRecords}); announcing is `NodeBlobService`'s, since this service has
  * no cohort. It also reads its own pins back ({@link BlobPinIndex}), offers the cache budget its
- * door onto the blobs held only for reads ({@link BlobCacheRecords}), and offers the reclaim pass its
- * door onto the marks on the blobs it keeps for the network ({@link BlobReclaimRecords}).
+ * door onto the blobs held only for reads ({@link BlobCacheRecords}), offers an operator's storage
+ * report its door onto what each hold accounts for ({@link BlobByteRecords}), and offers the reclaim
+ * pass its door onto the marks on the blobs it keeps for the network ({@link BlobReclaimRecords}).
  */
-export class LocalBlobService implements BlobService, BlobOwedRecords, BlobResponsibleRecords, BlobPinIndex, BlobCacheRecords, BlobReclaimRecords {
+export class LocalBlobService implements BlobService, BlobOwedRecords, BlobResponsibleRecords, BlobPinIndex, BlobCacheRecords, BlobByteRecords, BlobReclaimRecords {
 	private readonly pieces: IPieceStore;
 	private readonly records: BlobRecordStore;
 	private readonly gate = new SweepGate();
@@ -669,6 +694,53 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobRespo
 		return result.before !== undefined && result.after === undefined;
 	}
 
+	/**
+	 * {@link BlobByteRecords.bytesByHold}. Reads every record ({@link readableRecords}), as
+	 * `responsibleRefs`, `listPins` and `cachedBlobs` do; the `NOTE:` on `readableRecords` carries
+	 * that cost's tripwire.
+	 *
+	 * **One blob, one hold.** A blob carrying both `responsible` and `cached` — the ordinary state of
+	 * a blob pulled for an announcement (docs/blobs.md §Holds) — is counted once, under
+	 * `responsible`. The precedence is strongest reason first: a pin is the application's and is
+	 * never evicted, an `owed` blob is one no other machine holds yet, a `responsible` blob is this
+	 * node's job, and `cached` is the only hold anything gives up. So the `cached` figure is exactly
+	 * the bytes the cache budget can actually free, which is what makes it worth reporting.
+	 *
+	 * **It is an attribution, not a measurement, and it over-counts.** Pieces are shared between
+	 * blobs, so a piece in two blobs' trees counts in both; and a blob counts at its full size
+	 * whether or not every piece of it is here. Both are the direction docs/blobs.md §Lifetime
+	 * already takes for the cache budget, and the safe one. It therefore does not reconcile with the
+	 * piece store's own `bytesUsed()`, and must not be presented as if it did.
+	 *
+	 * An unreadable record is logged and skipped by {@link readableRecords}, as `responsibleRefs` and
+	 * `cachedBlobs` leave one out, so one bad record cannot fail a report.
+	 */
+	async bytesByHold(): Promise<Readonly<Record<BlobHoldKind, HoldBytes>>> {
+		const totals: Record<BlobHoldKind, { bytes: number; unsized: number }> = {
+			pin: { bytes: 0, unsized: 0 },
+			owed: { bytes: 0, unsized: 0 },
+			responsible: { bytes: 0, unsized: 0 },
+			cached: { bytes: 0, unsized: 0 },
+		};
+		for await (const { record } of this.readableRecords()) {
+			const kind = strongestHold(record.holds);
+			// A stored record always holds something (`holdsProblem` refuses one that does not), so this
+			// skips only a record a future hold kind this build does not know would leave.
+			if (kind === undefined) {
+				continue;
+			}
+			const into = totals[kind];
+			// Counted apart rather than as zero, the distinction `CachedBlob.bytes` draws: a report must
+			// not silently treat a cost this node never learned as no cost at all.
+			if (record.size === undefined) {
+				into.unsized++;
+			} else {
+				into.bytes += record.size;
+			}
+		}
+		return totals;
+	}
+
 	/** {@link BlobOwedRecords.emitDurability}. */
 	emitDurability(event: BlobDurabilityEvent): void {
 		for (const listener of [...this.durabilityListeners]) {
@@ -800,10 +872,11 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobRespo
 
 	/**
 	 * Every blob with a record this node can read, in `listRefs` order: the one pass behind `listPins`,
-	 * `responsibleRefs` and `cachedBlobs`, each of which filters it. A record that does not decode is
-	 * logged (`record:unreadable`) and left out, so one unreadable record cannot fail a caller's pass.
+	 * `responsibleRefs`, `cachedBlobs` and `bytesByHold`, each of which filters or folds it. A record
+	 * that does not decode is logged (`record:unreadable`) and left out, so one unreadable record
+	 * cannot fail a caller's pass.
 	 *
-	 * NOTE: one `get` per record, and the three callers above each walk the lot. If a machine ever holds
+	 * NOTE: one `get` per record, and the four callers above each walk the lot. If a machine ever holds
 	 * enough blobs for these passes to show up in a profile, index the records by what each pass asks
 	 * about (hold kinds, pin owners) rather than widening this one.
 	 */
@@ -1073,6 +1146,18 @@ function withoutUnreferencedSince(record: BlobRecord): BlobRecord {
 /** Held for reads and nothing else: the only blobs the cache budget counts and evicts (docs/blobs.md §Lifetime). */
 function cacheOnly(record: BlobRecord): boolean {
 	return record.holds.length > 0 && record.holds.every(hold => hold.kind === 'cached');
+}
+
+/**
+ * Strongest reason first, for {@link LocalBlobService.bytesByHold}: a pin is the application's and is
+ * never evicted, an `owed` blob is one no other machine holds yet, a `responsible` blob is this
+ * node's job, and `cached` is the only hold anything gives up on its own.
+ */
+const HOLD_PRECEDENCE: readonly BlobHoldKind[] = ['pin', 'owed', 'responsible', 'cached'];
+
+/** The one hold a blob is attributed to: the first of {@link HOLD_PRECEDENCE} its record carries. */
+function strongestHold(holds: readonly BlobHold[]): BlobHoldKind | undefined {
+	return HOLD_PRECEDENCE.find(kind => holds.some(hold => hold.kind === kind));
 }
 
 /**

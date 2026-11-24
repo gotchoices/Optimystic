@@ -1,6 +1,7 @@
 /**
- * Tickets: feat-blob-cached-copies-stay-within-a-budget and
- * the-blob-cache-budget-counts-a-partly-held-blob-as-nothing (docs/blobs.md §Lifetime).
+ * Tickets: feat-blob-cached-copies-stay-within-a-budget,
+ * the-blob-cache-budget-counts-a-partly-held-blob-as-nothing and
+ * blob-bytes-are-reported-by-hold-and-the-cache-gets-a-share (docs/blobs.md §Lifetime).
  *
  * The blobs a machine keeps only because it read them are evicted, least recently read first, once
  * they take more space than the budget allows — never while one of them is being read, and always
@@ -10,7 +11,7 @@
  */
 
 import { expect } from 'chai';
-import { buildBlob, rootPieceId, type BlobRef, type PieceId } from '@optimystic/db-core';
+import { buildBlob, rootPieceId, type BlobRef, type BlobScope, type PieceId } from '@optimystic/db-core';
 import { BlobCacheBudget } from '../src/blob/cache-budget.js';
 import { DEFAULT_BLOB_OWNER, type BlobRecord } from '../src/blob/blob-record.js';
 import { BlobRecordStore } from '../src/blob/blob-record-store.js';
@@ -29,9 +30,13 @@ function serviceOver(pieces: IPieceStore, kv: IKVStore): LocalBlobService {
 	return new LocalBlobService({ pieces, kv, setTimer: () => () => undefined });
 }
 
+/** A budget whose thunk answers the same figure every run: what these specs pin is the eviction rules, not the sizing. */
 function budgetOver(service: LocalBlobService, budgetBytes: number): BlobCacheBudget {
-	return new BlobCacheBudget({ records: service, budgetBytes, log: createLogger('blob:reclaim') });
+	return new BlobCacheBudget({ records: service, budgetBytes: async () => budgetBytes, log: createLogger('blob:reclaim') });
 }
+
+/** The scope a `responsible` hold is taken under here; nothing in these specs reads it back. */
+const SCOPE: BlobScope = 'app/photos/blobrefs';
 
 /** Deterministic bytes that differ by `seed`, so no two blobs here share a piece. */
 function bytesOf(length: number, seed: number): Uint8Array {
@@ -247,5 +252,29 @@ describe('BlobCacheBudget', () => {
 		expect(released.skippedInUse).to.equal(0);
 		expect(await recordOf(kv, reading.ref)).to.equal(undefined);
 		expect(await listed(pieces)).to.deep.equal([]);
+	});
+});
+
+describe('LocalBlobService.bytesByHold', () => {
+	it('counts a blob with two holds once, under the stronger', async () => {
+		const pieces = new MemoryPieceStore();
+		const kv = new MemoryKVStore();
+		const service = serviceOver(pieces, kv);
+		// Fetched for a read and then taken for an announcement: `responsible` AND `cached`, which is the
+		// ordinary state of a blob pulled for an announcement, not an edge case.
+		const both = await cacheOnlyBlob(service, kv, 1, 1);
+		await service.holdResponsible(both.ref, SCOPE);
+		// One blob under each of the other two holds a node takes without being asked, so a double count
+		// of the blob above would show up as the `cached` or `responsible` figure being twice this size.
+		await cacheOnlyBlob(service, kv, 2, 2);
+		// `put` pins under `DEFAULT_BLOB_OWNER`, and this one is never unpinned.
+		await service.put(streamOf(bytesOf(BLOB_BYTES, 3)));
+
+		const byHold = await service.bytesByHold();
+
+		expect(byHold.responsible).to.deep.equal({ bytes: BLOB_BYTES, unsized: 0 });
+		expect(byHold.cached).to.deep.equal({ bytes: BLOB_BYTES, unsized: 0 });
+		expect(byHold.pin).to.deep.equal({ bytes: BLOB_BYTES, unsized: 0 });
+		expect(byHold.owed).to.deep.equal({ bytes: 0, unsized: 0 });
 	});
 });

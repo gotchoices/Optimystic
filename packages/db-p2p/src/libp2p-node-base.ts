@@ -86,7 +86,7 @@ import type { ClusterLatestBatchCallback } from './repo/consult-round.js';
 import { RestorationCoordinator } from './storage/restoration-coordinator.js';
 import { DEFAULT_MIN_RING_CAPACITY_BYTES, RingSelector } from './storage/ring-selector.js';
 import { RingShiftCoordinator } from './storage/ring-shift-coordinator.js';
-import { StorageAccount } from './storage/storage-account.js';
+import { cacheBudgetBytes, StorageAccount } from './storage/storage-account.js';
 import type { StorageAllotmentOptions, StorageCapacity } from './storage/storage-account.js';
 import { ArachnodeFretAdapter } from './storage/arachnode-fret-adapter.js';
 import type { RestoreCallback, BlockArchive } from './storage/struct.js';
@@ -352,9 +352,15 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * no drain at all, and then `node.blobs.announce` REJECTS rather than recording an entry nothing
 	 * would ever send; such a node still serves, fetches and holds blobs.
 	 *
-	 * `cacheBudgetBytes` is how many bytes of blobs this node may keep purely because it read them
-	 * (`BlobCacheBudget` in `packages/db-p2p/src/blob/cache-budget.ts`, docs/blobs.md §Lifetime),
-	 * default `DEFAULT_BLOB_CACHE_BUDGET_BYTES` (256 MiB). Over the budget, the least recently read of
+	 * `cacheBudgetBytes` is the CAP on how many bytes of blobs this node may keep purely because it
+	 * read them (`BlobCacheBudget` in `packages/db-p2p/src/blob/cache-budget.ts`, docs/blobs.md
+	 * §Lifetime), default `DEFAULT_BLOB_CACHE_BUDGET_BYTES` (256 MiB). It is a cap and not the figure:
+	 * what the cache actually gets is the smallest of this, an eighth of
+	 * {@link NodeOptions.storageAllotment} (`CACHE_ALLOTMENT_SHARE`), and what the allotment leaves
+	 * after everything else the node stores — asked again at every enforcement, so an allotment the
+	 * operator lowers is seen without a restart (`cacheBudgetBytes` in
+	 * `packages/db-p2p/src/storage/storage-account.ts`). A node that can measure neither an allotment
+	 * nor its disk's free space keeps this flat figure. Over the budget, the least recently read of
 	 * those blobs lose their `cached` hold and are swept; a blob held for any other reason — pinned,
 	 * owed or responsible — is never counted or evicted, and a blob being read is never evicted. `0`
 	 * keeps no such blob beyond the ones being read. Anything but an integer at or above 0 throws.
@@ -1378,7 +1384,10 @@ export async function createLibp2pNodeBase(
 	// than each forming its own opinion of how full the machine is. A client has one because it fills
 	// the same disk — blob records, blob pieces, the owed-blob ledger — even though nothing on it
 	// reads the account yet.
-	const storageAccount = new StorageAccount(nodeStorage, options.storageAllotment);
+	// `blobRecords` is a thunk over the service built above, not the service itself: the account's
+	// option is a thunk so that a node whose blob service is built AFTER its account can still be
+	// given one, and reading it through the thunk keeps that true however the order here changes.
+	const storageAccount = new StorageAccount(nodeStorage, { ...options.storageAllotment, blobRecords: () => blobs });
 	// Before anything starts, beside the durability line, and awaited so an operator reading the
 	// start-up log sees the allotment next to what the node's writes survive.
 	// NOTE: with `node-wiring` logging ON this makes node construction wait on one block-store scan —
@@ -1889,7 +1898,14 @@ export async function createLibp2pNodeBase(
 		// BEFORE it and no enforcement writes a record or sweeps once the blob service has stopped.
 		const blobCacheBudget = new BlobCacheBudget({
 			records: blobs,
-			budgetBytes: blobCacheBudgetBytes,
+			// Asked once per enforcement rather than fixed here, so an allotment the operator lowered — or
+			// other use that grew — is seen without a restart. `capacity()` is memoized, so this costs a
+			// scan at most once per its TTL however often reads trigger an enforcement.
+			budgetBytes: async cachedBytes => cacheBudgetBytes({
+				declaredBytes: blobCacheBudgetBytes,
+				capacity: await storageAccount.capacity(),
+				cachedBytes,
+			}),
 			log: createLogger('blob:reclaim', node.peerId.toString()),
 		});
 		{

@@ -12,12 +12,17 @@ import type { BlobRef } from '@optimystic/db-core';
 import type { Logger } from '../logger.js';
 import type { BlobCacheRecords, CachedBlob } from './local-blob-service.js';
 
-/** 256 MiB: a phone's worth. A host with room sets more through `NodeOptions.blobs.cacheBudgetBytes`. */
+/**
+ * 256 MiB: a phone's worth, and a CAP rather than the figure. A host with room raises it through
+ * `NodeOptions.blobs.cacheBudgetBytes`; what the cache actually gets is the smallest of that cap, a
+ * share of the node's allotment, and what the allotment leaves after everything else
+ * (`cacheBudgetBytes` in `packages/db-p2p/src/storage/storage-account.ts`).
+ */
 export const DEFAULT_BLOB_CACHE_BUDGET_BYTES = 256 * 1024 * 1024;
 
 /** What one enforcement did. */
 export interface CacheEnforcement {
-	/** {@link CacheEvictionChoice.cachedBytes}, over the cache-only blobs this enforcement enumerated. */
+	/** {@link sizedCacheBytes}, over the cache-only blobs this enforcement enumerated. */
 	readonly cachedBytes: number;
 	readonly evicted: readonly BlobRef[];
 	/** How many blobs the budget would otherwise have evicted but left alone because a read or fetch of them was running. */
@@ -27,18 +32,21 @@ export interface CacheEnforcement {
 /** What `chooseEvictions` decided. */
 export interface CacheEvictionChoice {
 	readonly evict: readonly BlobRef[];
-	/**
-	 * The total of the blobs given whose size this node knows, before eviction. The unsized ones are
-	 * left out, which under-counts what the cache really takes — safe only because they are evicted in
-	 * the same pass, so the bytes this number omits are bytes the node is about to stop holding.
-	 */
-	readonly cachedBytes: number;
 	readonly skippedInUse: number;
 }
 
 export interface BlobCacheBudgetDeps {
 	readonly records: BlobCacheRecords;
-	readonly budgetBytes: number;
+	/**
+	 * What the cache may take, asked ONCE per enforcement rather than read at construction, so an
+	 * allotment the operator lowered — or other use that grew — is seen without a restart
+	 * (`cacheBudgetBytes` in `packages/db-p2p/src/storage/storage-account.ts`).
+	 *
+	 * Given the enforcement's own {@link sizedCacheBytes}, because the rule subtracts the cache's own
+	 * bytes from the node's use to see what is left for it, and this pass already has that figure: the
+	 * term costs no extra scan, and the budget and the eviction decision see one moment's cache.
+	 */
+	readonly budgetBytes: (cachedBytes: number) => Promise<number>;
 	readonly log: Logger;
 }
 
@@ -46,9 +54,31 @@ export interface BlobCacheBudgetDeps {
 const NOTHING_ENFORCED: CacheEnforcement = { cachedBytes: 0, evicted: [], skippedInUse: 0 };
 
 /**
+ * The total of the blobs given whose size this node knows. The unsized ones are left out, which
+ * under-counts what the cache really takes — safe only because {@link chooseEvictions} evicts them in
+ * the same pass, so the bytes this omits are bytes the node is about to stop holding.
+ *
+ * Lifted out of `chooseEvictions` so one enforcement computes it once: `runOnce` needs it to ask for
+ * the budget (the budget's third term subtracts the cache's own bytes from the node's use) and then
+ * hands it back to the choice.
+ */
+// NOTE: a cache-only blob counts at the blob's full size whether or not every piece is here, which
+// over-counts a partly held blob — the direction docs/blobs.md §Lifetime accepts for pieces shared
+// between blobs, since it evicts sooner and so uses less storage, not more. While nothing asks for
+// byte ranges the over-count is at most the tail of one interrupted download per blob; a caller that
+// reads small ranges out of very large blobs would count far more than it holds and evict a cache
+// that was never over its real limit. If ranged reads become ordinary, count what is held instead —
+// the fetch already knows the bytes it stored — rather than walking each tree, which costs one
+// piece-store read per piece per enforcement.
+export function sizedCacheBytes(blobs: readonly CachedBlob[]): number {
+	return blobs.reduce((total, blob) => total + (blob.bytes ?? 0), 0);
+}
+
+/**
  * Which of `blobs` to evict to bring their total within `budgetBytes`, least recently read first
  * (ties by reference ascending, so the choice is deterministic), skipping any `inUse` reports true
- * for. Pure: it reads nothing and writes nothing.
+ * for. `cachedBytes` is {@link sizedCacheBytes} over the same blobs, computed by the caller. Pure: it
+ * reads nothing and writes nothing.
  *
  * A blob whose record carries no size is evicted on its own account, whatever the total, and before
  * the walk: this node holds part of it and never learned how big the whole is, so it cannot bound
@@ -63,19 +93,10 @@ const NOTHING_ENFORCED: CacheEnforcement = { cachedBytes: 0, evicted: [], skippe
  * A budget the walk cannot reach because every remaining blob is in use leaves the cache over budget;
  * the next enforcement tries again, and nothing retries on a timer.
  */
-export function chooseEvictions(blobs: readonly CachedBlob[], budgetBytes: number, inUse: (ref: BlobRef) => boolean): CacheEvictionChoice {
+export function chooseEvictions(blobs: readonly CachedBlob[], cachedBytes: number, budgetBytes: number, inUse: (ref: BlobRef) => boolean): CacheEvictionChoice {
 	const ordered = [...blobs].sort(leastRecentlyReadFirst);
 	const sized = ordered.filter(isSized);
 	const unsized = ordered.filter(blob => !isSized(blob));
-	// NOTE: a cache-only blob counts at the blob's full size whether or not every piece is here, which
-	// over-counts a partly held blob — the direction docs/blobs.md §Lifetime accepts for pieces shared
-	// between blobs, since it evicts sooner and so uses less storage, not more. While nothing asks for
-	// byte ranges the over-count is at most the tail of one interrupted download per blob; a caller that
-	// reads small ranges out of very large blobs would count far more than it holds and evict a cache
-	// that was never over its real limit. If ranged reads become ordinary, count what is held instead —
-	// the fetch already knows the bytes it stored — rather than walking each tree, which costs one
-	// piece-store read per piece per enforcement.
-	const cachedBytes = sized.reduce((total, blob) => total + blob.bytes, 0);
 	const evict: BlobRef[] = [];
 	let skippedInUse = 0;
 	/** Whether `blob` was chosen; a blob being read or fetched is left alone and counted as skipped. */
@@ -99,7 +120,7 @@ export function chooseEvictions(blobs: readonly CachedBlob[], budgetBytes: numbe
 			evictedBytes += blob.bytes;
 		}
 	}
-	return { evict, cachedBytes, skippedInUse };
+	return { evict, skippedInUse };
 }
 
 /** A blob whose record carries a size, narrowed so the sized walk can add it up. */
@@ -120,7 +141,7 @@ function isSized(blob: CachedBlob): blob is CachedBlob & { readonly bytes: numbe
  */
 export class BlobCacheBudget {
 	private readonly records: BlobCacheRecords;
-	private readonly budgetBytes: number;
+	private readonly budgetBytes: (cachedBytes: number) => Promise<number>;
 	private readonly log: Logger;
 	/** The run in flight, absent while none runs. */
 	private running: Promise<CacheEnforcement> | undefined;
@@ -189,7 +210,12 @@ export class BlobCacheBudget {
 	// cache-only bytes in the record store — the same tripwire `responsibleRefs` and `listPins` carry.
 	private async runOnce(): Promise<CacheEnforcement> {
 		const blobs = await this.records.cachedBlobs();
-		const { evict, cachedBytes, skippedInUse } = chooseEvictions(blobs, this.budgetBytes, ref => this.records.inUse(ref));
+		// Summed, then asked, then chosen — all after the one `cachedBlobs` read above, so the budget's
+		// leftover term and the eviction decision see the same cache. A write that lands between them is
+		// the pre-existing window the single-flight-with-one-queued-follow-on already covers.
+		const cachedBytes = sizedCacheBytes(blobs);
+		const budgetBytes = await this.budgetBytes(cachedBytes);
+		const { evict, skippedInUse } = chooseEvictions(blobs, cachedBytes, budgetBytes, ref => this.records.inUse(ref));
 		const byRef = new Map(blobs.map(blob => [blob.ref, blob]));
 		const evicted: BlobRef[] = [];
 		let skipped = skippedInUse;
@@ -213,8 +239,8 @@ export class BlobCacheBudget {
 		}
 		// `evicted.length` is in the condition because an unsized blob is evicted whatever the total, so a
 		// pass that dropped only those would otherwise summarize nothing.
-		if (cachedBytes > this.budgetBytes || evicted.length > 0) {
-			this.log('cache:enforced cachedBytes=%d budget=%d evicted=%d skippedInUse=%d', cachedBytes, this.budgetBytes, evicted.length, skipped);
+		if (cachedBytes > budgetBytes || evicted.length > 0) {
+			this.log('cache:enforced cachedBytes=%d budget=%d evicted=%d skippedInUse=%d', cachedBytes, budgetBytes, evicted.length, skipped);
 		}
 		return { cachedBytes, evicted, skippedInUse: skipped };
 	}

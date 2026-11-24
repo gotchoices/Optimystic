@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { StorageAccount, effectiveTotalBytes, type StorageAllotmentOptions } from '../src/storage/storage-account.js';
+import { StorageAccount, cacheBudgetBytes, effectiveTotalBytes, type StorageAllotmentOptions, type StorageCapacity } from '../src/storage/storage-account.js';
 import type { IRawStorage } from '../src/storage/i-raw-storage.js';
 import type { NodeStorage } from '../src/storage/node-storage.js';
 import { MemoryKVStore } from '../src/storage/memory-kv-store.js';
@@ -65,6 +65,51 @@ describe('effectiveTotalBytes', () => {
 		for (const { allotment, location, expected, why } of cases) {
 			expect(effectiveTotalBytes(allotment, location), why).to.equal(expected);
 		}
+	});
+});
+
+const MIB = 1024 * 1024;
+const GIB = 1024 * MIB;
+
+/**
+ * Only the two figures `cacheBudgetBytes` reads. A capacity with no `totalBytes` is a node that
+ * configured no allotment on a backend reporting no free space — a memory storage, or SQLite and
+ * LevelDB handed an open handle.
+ */
+function capacityOf(totalBytes: number | undefined, usedBytes: number): StorageCapacity {
+	return { totalBytes, usedBytes };
+}
+
+describe('cacheBudgetBytes', () => {
+	it('takes the smallest of the declared cap, the share of the allotment and what the allotment leaves', () => {
+		const cases: Array<{ declaredBytes: number; total?: number; used: number; cached: number; expected: number; why: string }> = [
+			// An eighth of 64 GiB is 8 GiB, and nothing else is stored, so the host's own figure is the
+			// binding one — which is every allotment above 2 GiB, so no existing deployment's cache shrinks.
+			{ declaredBytes: 256 * MIB, total: 64 * GIB, used: 0, cached: 0, expected: 256 * MIB, why: 'the declared cap wins on a large allotment' },
+			// A 1 GiB host is smaller than the phone the 256 MiB default was written for, so the share binds.
+			{ declaredBytes: 256 * MIB, total: GIB, used: 0, cached: 0, expected: 128 * MIB, why: 'the share wins below a 2 GiB allotment' },
+			// 1000 MiB of the 1 GiB allotment is already spent on something that is not cache, so what is
+			// left is 24 MiB — less than the 128 MiB share, which is what makes the cache a tenant of the
+			// allotment rather than something beside it.
+			{ declaredBytes: 256 * MIB, total: GIB, used: 1000 * MIB, cached: 0, expected: 24 * MIB, why: 'what the allotment leaves wins when other use fills it' },
+			// Already over the allotment: the leftover term is negative and the floor evicts every
+			// cache-only blob that is not being read.
+			{ declaredBytes: 256 * MIB, total: GIB, used: 2 * GIB, cached: 0, expected: 0, why: 'a node over its allotment gets nothing' },
+			// Measures neither an allotment nor free space: today's flat budget, unchanged.
+			{ declaredBytes: 256 * MIB, total: undefined, used: 900 * MIB, cached: 0, expected: 256 * MIB, why: 'an unknown total falls back to the declared cap' },
+		];
+		for (const { declaredBytes, total, used, cached, expected, why } of cases) {
+			expect(cacheBudgetBytes({ declaredBytes, capacity: capacityOf(total, used), cachedBytes: cached }), why).to.equal(expected);
+		}
+	});
+
+	it('leaves the cache its share when every measured byte IS the cache', () => {
+		// Every measured byte is a cache-only blob: what the allotment leaves after everything ELSE is the
+		// whole allotment, so the share binds. Subtracting the cache's own bytes is what makes that true —
+		// without it the leftover reads as 0 and the cache shrinks itself to nothing on every pass.
+		const budget = cacheBudgetBytes({ declaredBytes: 256 * MIB, capacity: capacityOf(GIB, GIB), cachedBytes: GIB });
+
+		expect(budget).to.equal(128 * MIB);
 	});
 });
 
