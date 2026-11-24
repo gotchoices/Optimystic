@@ -1226,12 +1226,7 @@ function prepareServingStore(
 		pendLeaseMs: resolvePendLeaseMs(linkDeadlines.transactionTimeoutMs),
 	});
 
-	// Built after the repo because it reads `heldRevisions` through it: an entry carries the revision
-	// this node held when it released the block, which is what lets the sweep tell a block nobody has
-	// touched since from one a peer has pushed back (`ReleasedBlockEntry.releasedRev`).
-	const releasedBlockLedger = new ReleasedBlockLedger(kvStore, {
-		heldRevisions: blockIds => storageRepo.heldRevisions(blockIds)
-	});
+	const releasedBlockLedger = new ReleasedBlockLedger(kvStore);
 
 	const clusterProxy: ICluster = {
 		async update(record) {
@@ -3499,10 +3494,19 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 			 * correct, and the cost of losing the record is bytes this node keeps rather than a block the
 			 * cohort loses. The block is offered again by the next rebalance or shift that still finds it
 			 * outside this node's range.
+			 *
+			 * `releasedRevs` comes from the confirm step that made the release decision and is passed
+			 * straight through — nothing here reads a revision of its own, which is what keeps a replica a
+			 * peer pushed back between the confirmation and this write from being recorded as the revision
+			 * released (see `ReleasedBlockLedger.record`).
 			 */
-			const recordReleased = async (blockIds: readonly string[], source: ReleaseSource): Promise<void> => {
+			const recordReleased = async (
+				blockIds: readonly string[],
+				source: ReleaseSource,
+				releasedRevs: ReadonlyMap<string, number>
+			): Promise<void> => {
 				try {
-					const entries = await releasedBlockLedger.record(blockIds, source);
+					const entries = await releasedBlockLedger.record(blockIds, source, releasedRevs);
 					if (entries.length > 0) {
 						serving.late.requestReleasedBlockSweep?.();
 					}
@@ -3652,7 +3656,7 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 							// reaction: every monitor effect above was synchronous before the ledger existed and
 							// stays so, because deferring the growth feedback past a store write would let the
 							// re-check timer fire first and push a block again that was already confirmed.
-							await recordReleased(result.released, 'rebalance');
+							await recordReleased(result.released, 'rebalance', result.releasedRevs);
 						}).catch((err) => {
 							// NOTE: accepted tradeoff — recording nothing here means growthMaxAttempts (which
 							// only counts RECORDED incomplete outcomes) never bounds a reaction that throws
@@ -3681,11 +3685,11 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 						selfPeerId: peerId,
 						membership,
 						getFloor: () => rebalanceMonitor.getCohortSize(),
-						onRelease: async (blockIds) => {
+						onRelease: async (blockIds, releasedRevs) => {
 							for (const blockId of blockIds) {
 								rebalanceMonitor.untrackBlock(blockId);
 							}
-							await recordReleased(blockIds, 'ring-shift');
+							await recordReleased(blockIds, 'ring-shift', releasedRevs);
 						},
 						// Phase C's blob effect, through the late binding the blob monitor's own wiring fills
 						// in (it is built after this role, beside the blob service it reacts with). Absent on a

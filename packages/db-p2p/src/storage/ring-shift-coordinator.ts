@@ -19,7 +19,16 @@ export interface ReplicationConfirmer {
 		blockIds: string[],
 		owners: Map<string, string[]>,
 		floor: number
-	): Promise<{ confirmed: string[]; unconfirmed: string[] }>;
+	): Promise<{
+		confirmed: string[];
+		unconfirmed: string[];
+		/**
+		 * Per confirmed block, the revision the confirm handed over. Phase C passes it to
+		 * {@link RingShiftDeps.onRelease} so the released-block ledger records the revision the HANDOFF
+		 * gave away rather than one read after the release — see `ReleasedBlockEntry.releasedRev`.
+		 */
+		confirmedRevs: ReadonlyMap<string, number>;
+	}>;
 }
 
 export interface RingShiftDeps {
@@ -46,7 +55,7 @@ export interface RingShiftDeps {
 	 * bytes this node keeps until something offers the block again. The wiring logs that; this phase
 	 * does not swallow a rejection, so a caller still sees a failed `executeShift`.
 	 */
-	onRelease: (blockIds: string[]) => void | Promise<void>;
+	onRelease: (blockIds: string[], releasedRevs: ReadonlyMap<string, number>) => void | Promise<void>;
 	/**
 	 * Called once Phase C of a **move-out** has advertised the narrower slice, with the slice this node
 	 * covered before and the one it covers now. Nothing else fires it: a move-in widens, and a shift
@@ -195,7 +204,10 @@ export class RingShiftCoordinator {
 		// `onRelease` is deliberately allowed to surface.
 		this.announceNarrowed({ from: oldInfo?.partition, to: target.partition });
 		if (shed.length > 0) {
-			await this.deps.onRelease(shed);
+			// The revisions come from Phase B, read strictly before the advertisement above flipped — which
+			// is what makes every write that lands after this an advance, so a replica a peer pushes back
+			// in the gap before the ledger write is kept by the sweep rather than deleted.
+			await this.deps.onRelease(shed, confirm.releasedRevs);
 		}
 		log('phaseC:release from=%d to=%d shed=%d', oldRing, newRingDepth, shed.length);
 		return { status: 'moved-out', from: oldRing, to: newRingDepth, released: shed };
@@ -205,21 +217,26 @@ export class RingShiftCoordinator {
 	 * Phase B. Succeeds only when EVERY shed block is confirmed replicated to ≥ `floor` qualifying
 	 * holders. Aborts (no partial release) on a detected partition or any unconfirmed block.
 	 */
-	private async confirmShedRange(shed: string[], floor: number): Promise<{ ok: true } | { ok: false; reason: string }> {
+	private async confirmShedRange(
+		shed: string[],
+		floor: number
+	): Promise<{ ok: true; releasedRevs: ReadonlyMap<string, number> } | { ok: false; reason: string }> {
 		if (shed.length === 0) {
-			return { ok: true }; // nothing to shed → trivially safe
+			return { ok: true, releasedRevs: new Map() }; // nothing to shed → trivially safe
 		}
 		if (this.deps.partitionDetector.detectPartition()) {
 			return { ok: false, reason: 'partition' };
 		}
 
 		const owners = await this.buildOwnersMap(shed, floor);
-		const { confirmed, unconfirmed } = await this.deps.confirmer.confirmReplicated(shed, owners, floor);
+		const { confirmed, unconfirmed, confirmedRevs } = await this.deps.confirmer.confirmReplicated(shed, owners, floor);
 		if (unconfirmed.length > 0) {
 			return { ok: false, reason: `unconfirmed:${unconfirmed.length}` };
 		}
 		// Belt-and-suspenders: every shed block must be in `confirmed` before any is released.
-		return confirmed.length === shed.length ? { ok: true } : { ok: false, reason: 'incomplete' };
+		return confirmed.length === shed.length
+			? { ok: true, releasedRevs: confirmedRevs }
+			: { ok: false, reason: 'incomplete' };
 	}
 
 	/**

@@ -61,6 +61,17 @@ export interface RebalanceReactionResult {
 	released: string[];
 	/** Lost blocks whose replication could not be confirmed — keep serving, retry later. */
 	retained: string[];
+	/**
+	 * For each block in `released`, the revision this node handed over — what
+	 * {@link confirmReplicated} read off its own store when it pushed the block to the new owners.
+	 * This is what the released-block ledger records, so the sweep's written-again check compares
+	 * against the revision the release actually gave away rather than whatever this node's metadata
+	 * said at some later moment (`ReleasedBlockEntry.releasedRev`).
+	 *
+	 * A released block whose revision was not read has NO entry, which the ledger reads as "no
+	 * revision" — under which the sweep declines a block that holds any revision now.
+	 */
+	releasedRevs: ReadonlyMap<string, number>;
 	/** Grown blocks confirmed pushed to every newly co-responsible peer (capped by the floor). */
 	replicated: string[];
 	/**
@@ -189,7 +200,7 @@ export class BlockTransferCoordinator {
 		const [confirmResult, growResult] = await Promise.all([
 			event.lost.length > 0 && event.newOwners.size > 0
 				? this.confirmReplicated(event.lost, event.newOwners, floor)
-				: { confirmed: [], unconfirmed: [...event.lost] },
+				: { confirmed: [], unconfirmed: [...event.lost], confirmedRevs: new Map<string, number>() },
 			this.replicateGrown(event.grown, floor)
 		]);
 
@@ -200,6 +211,7 @@ export class BlockTransferCoordinator {
 		return {
 			released: confirmResult.confirmed,
 			retained: confirmResult.unconfirmed,
+			releasedRevs: confirmResult.confirmedRevs,
 			replicated: growResult.confirmed,
 			underReplicated: growResult.unconfirmed,
 			growth: growResult.growth
@@ -329,6 +341,15 @@ export class BlockTransferCoordinator {
 	 * `confirm:peer-full` rather than as an owner that did not have the block, so an operator reading a
 	 * handoff that will not confirm can tell new owners that are FULL from ones that are unreachable.
 	 *
+	 * `confirmedRevs` carries, per CONFIRMED block, the revision this node handed over — the `latest`
+	 * {@link executeConfirm} read off the local store when it pushed. The release paths record it in the
+	 * released-block ledger, which is the only ordering that is safe: the revision has to come from the
+	 * step that made the release decision, because anything read AFTER the release may be a replica a
+	 * peer pushed back in the meantime, and recording that as released would let the sweep delete bytes
+	 * this node has just accepted and started serving again. A confirmed block whose revision was not
+	 * read (a repo that reports no `latest`) has no entry; the ledger reads that as "no revision", under
+	 * which the sweep declines a block that holds one now.
+	 *
 	 * @param owners  blockId → candidate owner peer ids. The caller MUST have already excluded self and
 	 *   any same-range mover (a peer shedding the same sub-range), so every id here is a qualifying holder.
 	 * @param floor   required confirming owners per block (the replication floor `N`).
@@ -337,7 +358,7 @@ export class BlockTransferCoordinator {
 		blockIds: string[],
 		owners: Map<string, string[]>,
 		floor: number
-	): Promise<{ confirmed: string[]; unconfirmed: string[] }> {
+	): Promise<{ confirmed: string[]; unconfirmed: string[]; confirmedRevs: Map<string, number> }> {
 		// NOTE: unlike pushBlocks, this deliberately does NOT honor `enablePush` — confirmation
 		// fundamentally requires pushing to verify replication, and skipping it would leave every
 		// block unconfirmed → never released → the node never sheds. So `enablePush:false` no longer
@@ -346,24 +367,31 @@ export class BlockTransferCoordinator {
 		// not this primitive.
 		if (this.partitionDetector.detectPartition()) {
 			log('confirm:partition-detected, leaving %d blocks unconfirmed', blockIds.length);
-			return { confirmed: [], unconfirmed: [...blockIds] };
+			return { confirmed: [], unconfirmed: [...blockIds], confirmedRevs: new Map() };
 		}
 		if (floor <= 0) {
 			// A non-positive floor cannot be safely "met"; refuse to release rather than release for free.
-			return { confirmed: [], unconfirmed: [...blockIds] };
+			return { confirmed: [], unconfirmed: [...blockIds], confirmedRevs: new Map() };
 		}
 
 		const confirmed: string[] = [];
 		const unconfirmed: string[] = [];
+		const confirmedRevs = new Map<string, number>();
 
 		const ids = blockIds.filter(id => !this.inFlight.has(`confirm:${id}`));
 		await Promise.all(ids.map(async id => {
 			const result = await this.executeConfirm(id, owners, floor);
 			if (result === null) return; // raced into flight after the filter — no information
-			(result.confirmed ? confirmed : unconfirmed).push(id);
+			if (!result.confirmed) {
+				unconfirmed.push(id);
+				return;
+			}
+			confirmed.push(id);
+			// Only for a confirmed block: an unconfirmed one is not released, so its revision records nothing.
+			if (result.confirmedRev !== undefined) confirmedRevs.set(id, result.confirmedRev);
 		}));
 
-		return { confirmed, unconfirmed };
+		return { confirmed, unconfirmed, confirmedRevs };
 	}
 
 	private async executePush(
@@ -432,8 +460,9 @@ export class BlockTransferCoordinator {
 	 * must not record anything for it). Otherwise: `confirmed` iff the floor was met; `confirmedPeers`
 	 * is the union of owners that confirmed across every attempt (a peer that accepted a push holds a
 	 * replica even if a later round missed it — the floor decision itself stays per-round, unchanged);
-	 * `noLocalData` marks the nothing-local-to-push case. The lost-block release path uses only
-	 * `confirmed`; the growth arm consumes the other two.
+	 * `noLocalData` marks the nothing-local-to-push case; `confirmedRev` is the revision this node
+	 * handed over (see below). The lost-block release path uses `confirmed` and `confirmedRev`; the
+	 * growth arm consumes `confirmedPeers` and `noLocalData`.
 	 *
 	 * `fullPeers`, when given, is the caller's pass-scoped memory of peers that answered out of space:
 	 * such a peer is not pushed to again in any later round here, and a peer that answers it is added.
@@ -446,17 +475,24 @@ export class BlockTransferCoordinator {
 		owners: Map<string, string[]>,
 		floor: number,
 		fullPeers?: Set<string>
-	): Promise<{ confirmed: boolean; confirmedPeers: Set<string>; noLocalData: boolean } | null> {
+	): Promise<{ confirmed: boolean; confirmedPeers: Set<string>; noLocalData: boolean; confirmedRev: number | undefined } | null> {
 		const key = `confirm:${blockId}`;
 		if (this.inFlight.has(key)) return null;
 		this.inFlight.add(key);
 
 		try {
 			const allConfirmedPeers = new Set<string>();
+			/**
+			 * The revision of the bytes the FIRST attempt read and handed over, and whether an attempt
+			 * has read one at all (the flag, because "read, and the repo reported no `latest`" and "not
+			 * read yet" are different and both answer `undefined`).
+			 */
+			let revRead = false;
+			let confirmedRev: number | undefined;
 			const candidateOwners = owners.get(blockId) ?? [];
 			if (candidateOwners.length === 0) {
 				// No qualifying holder to confirm against — cannot release; keep serving.
-				return { confirmed: false, confirmedPeers: allConfirmedPeers, noLocalData: false };
+				return { confirmed: false, confirmedPeers: allConfirmedPeers, noLocalData: false, confirmedRev };
 			}
 
 			for (let attempt = 0; ; attempt++) {
@@ -472,7 +508,18 @@ export class BlockTransferCoordinator {
 						// `unavailable` read (this node could not find out what it holds) is folded in
 						// here as it always was: neither outcome can confirm anything.
 						log('confirm:no-local-data block=%s status=%s', blockId, outcome.status);
-						return { confirmed: false, confirmedPeers: allConfirmedPeers, noLocalData: true };
+						return { confirmed: false, confirmedPeers: allConfirmedPeers, noLocalData: true, confirmedRev };
+					}
+					if (!revRead) {
+						// The FIRST revision any attempt read, deliberately not the confirming round's: a long
+						// confirm may run several attempts, and a write landing between two of them would
+						// otherwise be reported as the revision released — which is the whole defect this
+						// sourcing exists to prevent. The earliest read is the most conservative revision still
+						// available, and recording a revision that is too OLD can only make the sweep decline
+						// (bytes kept, block re-offered by the next pass), never delete a replica this node has
+						// accepted. Do not "simplify" this to the last read.
+						revRead = true;
+						confirmedRev = outcome.latest?.rev;
 					}
 					logRefusals('confirm', blockId, outcome.refusals);
 					for (const peerId of outcome.confirmed) {
@@ -491,14 +538,14 @@ export class BlockTransferCoordinator {
 
 				if (confirmCount >= floor) {
 					log('confirm:ok block=%s holders=%d/%d', blockId, confirmCount, floor);
-					return { confirmed: true, confirmedPeers: allConfirmedPeers, noLocalData: false };
+					return { confirmed: true, confirmedPeers: allConfirmedPeers, noLocalData: false, confirmedRev };
 				}
 				if (fullPeers !== undefined && candidateOwners.every(peerId => fullPeers.has(peerId))) {
 					// Every candidate answered out of space, so a retry would push to nobody — it would only
 					// sleep out the backoff and report the same thing. The caller reads `fullPeers` itself to
 					// decide what to report for the block.
 					log('confirm:all-full block=%s owners=%d', blockId, candidateOwners.length);
-					return { confirmed: false, confirmedPeers: allConfirmedPeers, noLocalData: false };
+					return { confirmed: false, confirmedPeers: allConfirmedPeers, noLocalData: false, confirmedRev };
 				}
 				if (attempt < this.maxRetries) {
 					log('confirm:retry block=%s holders=%d/%d attempt=%d', blockId, confirmCount, floor, attempt + 1);
@@ -506,7 +553,7 @@ export class BlockTransferCoordinator {
 					continue;
 				}
 				log('confirm:unmet block=%s holders=%d/%d', blockId, confirmCount, floor);
-				return { confirmed: false, confirmedPeers: allConfirmedPeers, noLocalData: false };
+				return { confirmed: false, confirmedPeers: allConfirmedPeers, noLocalData: false, confirmedRev };
 			}
 		} finally {
 			this.inFlight.delete(key);

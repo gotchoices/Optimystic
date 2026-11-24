@@ -1,14 +1,15 @@
 import { expect } from 'chai';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
-import type { ActionId } from '@optimystic/db-core';
+import type { ActionId, BlockId, IBlock } from '@optimystic/db-core';
 import { hashKey } from 'p2p-fret';
 import type { FretService } from 'p2p-fret';
 import { RingShiftCoordinator, type ReplicationConfirmer, type RingShiftDeps } from '../src/storage/ring-shift-coordinator.js';
 import { ReleasedBlockLedger } from '../src/storage/released-block-ledger.js';
 import { ReleasedBlockSweep } from '../src/storage/released-block-sweep.js';
-import type { ReleasedBlockDeleteOutcome } from '../src/storage/storage-repo.js';
+import { StorageRepo, type ReleasedBlockDeleteOutcome } from '../src/storage/storage-repo.js';
 import { MemoryKVStore } from '../src/storage/memory-kv-store.js';
+import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { createLogger } from '../src/logger.js';
 import { RingSelector } from '../src/storage/ring-selector.js';
 import { PartitionDetector } from '../src/cluster/partition-detector.js';
@@ -67,6 +68,12 @@ class MockFret {
 class StubConfirmer implements ReplicationConfirmer {
 	calls: Array<{ blockIds: string[]; owners: Map<string, string[]>; floor: number }> = [];
 	behavior: 'byCount' | 'fail' = 'byCount';
+	/**
+	 * The revision the stub pretends every push handed over, reported per confirmed block as the real
+	 * confirm does (`BlockTransferCoordinator.confirmReplicated`'s `confirmedRevs`). `undefined` models
+	 * a confirm that read no revision.
+	 */
+	handedOverRev: number | undefined = undefined;
 	/** Runs at the instant Phase B is in flight (self is already `moving`) — used to snapshot the count. */
 	onConfirm?: () => void;
 
@@ -75,12 +82,15 @@ class StubConfirmer implements ReplicationConfirmer {
 		this.onConfirm?.();
 		const confirmed: string[] = [];
 		const unconfirmed: string[] = [];
+		const confirmedRevs = new Map<string, number>();
 		for (const id of blockIds) {
 			const o = owners.get(id) ?? [];
-			if (this.behavior === 'byCount' && o.length >= floor) confirmed.push(id);
-			else unconfirmed.push(id);
+			if (this.behavior === 'byCount' && o.length >= floor) {
+				confirmed.push(id);
+				if (this.handedOverRev !== undefined) confirmedRevs.set(id, this.handedOverRev);
+			} else unconfirmed.push(id);
 		}
-		return { confirmed, unconfirmed };
+		return { confirmed, unconfirmed, confirmedRevs };
 	}
 }
 
@@ -232,13 +242,10 @@ describe('RingShiftCoordinator — advertise→confirm→release handoff', () =>
 		 */
 		it('deletes only the blocks the confirm step counted — nothing after a rolled-back shift, both after a confirmed one', async () => {
 			const kv = new MemoryKVStore();
-			// Every block reads as holding revision 4, so an entry carries a real revision for the sweep's
-			// written-again check to compare against rather than the absent-metadata case.
-			const ledger = new ReleasedBlockLedger(kv, {
-				heldRevisions: async (blockIds) => Object.fromEntries(
-					blockIds.map(id => [id, { rev: 4, actionId: 'a4' as ActionId }])
-				)
-			});
+			const ledger = new ReleasedBlockLedger(kv);
+			// Every confirm reports having handed over revision 4, so an entry carries a real revision for
+			// the sweep's written-again check to compare against rather than the no-revision case.
+			confirmer.handedOverRev = 4;
 			const deletedBlocks: string[] = [];
 			const sweep = new ReleasedBlockSweep({
 				ledger,
@@ -252,9 +259,9 @@ describe('RingShiftCoordinator — advertise→confirm→release handoff', () =>
 				},
 				log: createLogger('storage:released')
 			});
-			const recordRelease: RingShiftDeps['onRelease'] = async (ids) => {
+			const recordRelease: RingShiftDeps['onRelease'] = async (ids, releasedRevs) => {
 				released.push(...ids);
-				await ledger.record(ids, 'ring-shift');
+				await ledger.record(ids, 'ring-shift', releasedRevs);
 			};
 
 			adapter.setSelf(active(0, undefined));
@@ -287,7 +294,7 @@ describe('RingShiftCoordinator — advertise→confirm→release handoff', () =>
 			expect(new Set(released), 'Phase C released exactly the shed half').to.deep.equal(new Set([shedBlock, shedBlock2]));
 			const entries = await ledger.list();
 			expect(entries.map(entry => entry.source), 'each entry names the path that released it').to.deep.equal(['ring-shift', 'ring-shift']);
-			expect(entries.every(entry => entry.releasedRev === 4), 'each entry carries the revision held at release').to.equal(true);
+			expect(entries.every(entry => entry.releasedRev === 4), 'each entry carries the revision the confirm handed over').to.equal(true);
 
 			const afterRelease = await sweep.sweep();
 			expect(afterRelease, 'both released blocks deleted, ledger left empty')
@@ -295,6 +302,61 @@ describe('RingShiftCoordinator — advertise→confirm→release handoff', () =>
 			expect(new Set(deletedBlocks), 'only the confirmed shed blocks were deleted').to.deep.equal(new Set([shedBlock, shedBlock2]));
 			expect(deletedBlocks, 'the kept block was never given to the delete').to.not.include(keptBlock);
 			expect(await ledger.list(), 'an entry is dropped only after its delete').to.deep.equal([]);
+		});
+
+		/**
+		 * Ticket: bug-a-replica-pushed-back-during-a-release-can-still-be-deleted. The window the whole
+		 * revision-sourcing exists to close: Phase C releases the range, and a peer pushes the block back
+		 * BEFORE the ledger write — the production ordering, since `onRelease` untracks and then records.
+		 * The entry must carry the revision the confirm handed over (1), not the one that landed in the
+		 * gap (2), so the sweep sees an advance and keeps bytes the node has started serving again.
+		 *
+		 * A real `StorageRepo` over a real `MemoryRawStorage`, because the claim is about what the delete
+		 * decides against live metadata — the stubbed-deleter case above cannot see it.
+		 */
+		it('keeps a replica pushed back between Phase C and the ledger write, rather than deleting it', async () => {
+			const raw = new MemoryRawStorage();
+			const repo = new StorageRepo(raw);
+			const blockOf = (id: string): IBlock =>
+				({ header: { id, type: 'test', collectionId: 'c' } }) as unknown as IBlock;
+
+			// What this node holds — and hands over — when the shift runs.
+			await repo.saveReplicatedBlock(shedBlock as BlockId, blockOf(shedBlock), { rev: 1, actionId: 'a1' as ActionId });
+			confirmer.handedOverRev = 1;
+
+			const kv = new MemoryKVStore();
+			const ledger = new ReleasedBlockLedger(kv);
+			const sweep = new ReleasedBlockSweep({ ledger, storage: repo, log: createLogger('storage:released') });
+
+			const recordRelease: RingShiftDeps['onRelease'] = async (ids, releasedRevs) => {
+				released.push(...ids);
+				// The push that lands in the gap: the range is released and no longer advertised, but the
+				// node accepts the replica and is serving it again from this instant.
+				await repo.saveReplicatedBlock(shedBlock as BlockId, blockOf(shedBlock), { rev: 2, actionId: 'a2' as ActionId });
+				await ledger.record(ids, 'ring-shift', releasedRevs);
+			};
+
+			adapter.setSelf(active(0, undefined));
+			adapter.setPeer(peerA, active(1, { prefixBits: 1, prefixValue: shedBit0 }));
+			adapter.setPeer(peerB, active(1, { prefixBits: 1, prefixValue: shedBit0 }));
+			fret.setCohort([selfId, peerA, peerB]);
+
+			const outcome = await makeCoordinator(new Set([shedBlock]), undefined, recordRelease)
+				.executeShift({ direction: 'out', newRingDepth: 1 });
+
+			expect(outcome.status, 'the shift completed').to.equal('moved-out');
+			const entries = await ledger.list();
+			expect(entries.map(entry => entry.releasedRev), 'the entry carries the revision HANDED OVER, not the one pushed back')
+				.to.deep.equal([1]);
+
+			const run = await sweep.sweep();
+			expect(run, 'the block advanced past its released revision, so it is kept')
+				.to.deep.include({ found: 1, deleted: 0, kept: 1, failed: 0, remaining: 0 });
+			expect((await repo.heldRevisions([shedBlock as BlockId]))[shedBlock]?.rev, 'the pushed-back revision is still held')
+				.to.equal(2);
+			expect((await repo.get({ blockIds: [shedBlock as BlockId] }))[shedBlock]?.block, 'and its bytes still read back')
+				.to.not.equal(undefined);
+			expect(await ledger.list(), 'a kept block stops being a released block — its entry is dropped too').to.deep.equal([]);
 		});
 	});
 

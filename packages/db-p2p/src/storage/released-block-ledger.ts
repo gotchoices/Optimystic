@@ -9,6 +9,13 @@
  * {@link ReleasedBlockSweep} derives no eligibility of its own: a block that merely looks outside this
  * node's current slice may be one whose handoff rolled back, and is still being served.
  *
+ * It reads no block metadata either, and that is deliberate rather than incidental: the revision an
+ * entry carries ({@link ReleasedBlockEntry.releasedRev}) is **supplied by the release**, which is the
+ * only ordering that is safe. A revision this module read for itself would be read after the release
+ * that is being recorded, so a replica pushed back in between would be recorded as the revision handed
+ * over, and the sweep would delete a block this node had accepted again. See {@link
+ * ReleasedBlockLedger.record}.
+ *
  * Durable for two reasons, and both matter. A restart must not lose the knowledge that bytes are free
  * to go — before this ledger the eligibility lived in a `Set<string>` in the node factory, so a node
  * that shed its way from ring 3 to ring 6 forgot which seven eighths of its data it had given away.
@@ -17,7 +24,7 @@
  * *after* the delete rather than before.
  */
 
-import type { ActionRev, BlockId } from '@optimystic/db-core';
+import type { BlockId } from '@optimystic/db-core';
 import { KeyedSerialQueue } from '../keyed-serial-queue.js';
 import { createLogger } from '../logger.js';
 import type { IKVStore } from './i-kv-store.js';
@@ -58,15 +65,17 @@ export type ReleasedBlockEntry = {
 	readonly releasedAt: number;
 	readonly source: ReleaseSource;
 	/**
-	 * The committed revision this node held when it released the block. The sweep re-reads the block's
-	 * `latest` under its write latch and declines to delete a block that has advanced past this, which
-	 * is how a replica pushed back to this node between the release and the sweep survives: the node
-	 * accepted it, so someone is using it again, and the entry is dropped instead of taken.
+	 * The revision the confirmed handoff **handed over** — the `latest` the confirm step read off this
+	 * node's store when it pushed the block to its new holders, supplied to {@link
+	 * ReleasedBlockLedger.record} by that step (`BlockTransferCoordinator.confirmReplicated`). The
+	 * sweep re-reads the block's `latest` under its write latch and declines to delete a block that has
+	 * advanced past this, which is how a replica pushed back to this node between the release and the
+	 * sweep survives: the node accepted it, so someone is using it again, and the entry is dropped
+	 * instead of taken.
 	 *
-	 * Absent when the node held no committed revision at release (a block seeded by a pending record
-	 * alone), and also when its metadata could not be read then — `StorageRepo.heldRevisions` leaves
-	 * such a block out of its answer. Both read as "no revision was held", under which the sweep
-	 * declines a block that holds one now.
+	 * Absent when the confirm read no revision — a repo that reported no `latest` for the block (one
+	 * seeded by a pending record alone), or a release that recorded no revision for it at all. Both read
+	 * as "no revision was handed over", under which the sweep declines a block that holds one now.
 	 */
 	readonly releasedRev?: number;
 	/**
@@ -92,14 +101,6 @@ export function hasExhaustedAttempts(entry: ReleasedBlockEntry): boolean {
 }
 
 export type ReleasedBlockLedgerDeps = {
-	/**
-	 * What this node's metadata says each block's committed latest is — `StorageRepo.heldRevisions`
-	 * (`IHeldRevisionReader`), read once per {@link ReleasedBlockLedger.record} call so an entry
-	 * carries the revision the release happened at. Unlatched, as that reader is: a commit landing
-	 * meanwhile only makes the recorded revision early, which makes the sweep decline the block rather
-	 * than take it — the safe direction.
-	 */
-	readonly heldRevisions: (blockIds: BlockId[]) => Promise<Record<BlockId, ActionRev | null>>;
 	/** Default `Date.now`. */
 	readonly now?: () => number;
 };
@@ -110,11 +111,9 @@ export type ReleasedBlockLedgerDeps = {
  */
 export class ReleasedBlockLedger {
 	private readonly queue = new KeyedSerialQueue();
-	private readonly heldRevisions: ReleasedBlockLedgerDeps['heldRevisions'];
 	private readonly now: () => number;
 
-	constructor(private readonly kv: IKVStore, deps: ReleasedBlockLedgerDeps) {
-		this.heldRevisions = deps.heldRevisions;
+	constructor(private readonly kv: IKVStore, deps: ReleasedBlockLedgerDeps = {}) {
 		this.now = deps.now ?? Date.now;
 	}
 
@@ -122,29 +121,39 @@ export class ReleasedBlockLedger {
 	 * Record every block of `blockIds` as released, and answer the entries written. **Only a release
 	 * that followed a confirmation may call this** — see this module's header for why nothing else may.
 	 *
+	 * `releasedRevs` is the revision each block's confirmation handed over, from the step that made the
+	 * release decision; a block it has no entry for is recorded with no revision. This ledger reads no
+	 * metadata of its own, and that is the point: anything read HERE is read after the release, so a
+	 * replica a peer pushed back in the gap between the confirmation and this write would be recorded as
+	 * if it were the revision handed over — and the sweep would then delete bytes the node has accepted
+	 * and started serving again. Only the confirming step can see the release it is recording, so only
+	 * it may source the revision.
+	 *
 	 * A block already in the ledger is **refreshed** rather than left: the release moment, the source
-	 * and the held revision are rewritten and the attempt count starts again. Refreshing is what keeps
-	 * a block that was pushed back and then released a second time sweepable — an entry still carrying
-	 * the first release's revision would make the sweep decline it for ever — and it is what makes a
-	 * double release idempotent.
+	 * and the released revision are rewritten and the attempt count starts again. Refreshing is what
+	 * keeps a block that was pushed back and then released a second time sweepable — an entry still
+	 * carrying the first release's revision would make the sweep decline it for ever — and it is what
+	 * makes a double release idempotent.
 	 *
 	 * Durable before it resolves: the ledger exists so that a restart does not forget which bytes are
 	 * free to go, so no call may report what a restart would forget.
 	 */
-	async record(blockIds: readonly BlockId[], source: ReleaseSource): Promise<ReleasedBlockEntry[]> {
+	async record(
+		blockIds: readonly BlockId[],
+		source: ReleaseSource,
+		releasedRevs: ReadonlyMap<BlockId, number>
+	): Promise<ReleasedBlockEntry[]> {
 		const ids = [...new Set(blockIds)];
 		if (ids.length === 0) {
 			return [];
 		}
-		// One read for the whole release rather than one per block: `heldRevisions` reads each block's
-		// metadata and nothing more, and it already answers for a set.
-		const held = await this.heldRevisions(ids);
 		const releasedAt = this.now();
 		const entries: ReleasedBlockEntry[] = [];
 		// Sequential on purpose, as the other ledgers' scans are: one entry is one small file under
 		// `FileKVStore`, and writing them all at once would trade a faster release for file-descriptor
 		// exhaustion on a node shedding tens of thousands of blocks.
 		for (const blockId of ids) {
+			const releasedRev = releasedRevs.get(blockId);
 			const entry = await this.queue.run(blockId, async () => {
 				// Built field by field rather than spread over any existing entry, so that a refresh keeps
 				// nothing from the previous release — `attempts` above all, which a fresh release resets.
@@ -152,7 +161,7 @@ export class ReleasedBlockLedger {
 					blockId,
 					releasedAt,
 					source,
-					...(held[blockId] ? { releasedRev: held[blockId]!.rev } : {})
+					...(releasedRev !== undefined ? { releasedRev } : {})
 				};
 				await this.kv.set(keyFor(blockId), JSON.stringify(stored));
 				return stored;

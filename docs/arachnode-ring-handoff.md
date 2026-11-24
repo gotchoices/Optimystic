@@ -281,7 +281,7 @@ enforce is stated over that pair:
 > **A block's bytes are deleted only after a release that confirmed at least the replication floor of
 > other serving holders hold a current replica of it.**
 
-Three consequences worth stating, because each is a way that rule could be lost:
+Four consequences worth stating, because each is a way that rule could be lost:
 
 - **The ledger is the sweep's only input.** The sweep never works out eligibility from this node's own
   ring or partition. Mid-shift the advertised partition is the *target* ring, so a block that looks
@@ -292,6 +292,13 @@ Three consequences worth stating, because each is a way that rule could be lost:
   ([storage.md § Deleting a block](../packages/db-p2p/docs/storage.md#deleting-a-block)) precisely so
   the entry can be dropped *after* the delete. A crash mid-delete therefore leaves content with no
   metadata and an entry that the next run finishes.
+- **The revision an entry records is the one the confirmation handed over**, supplied by the confirm
+  step itself (`BlockTransferCoordinator.confirmReplicated` reports it per confirmed block, and Phase C
+  passes it to the ledger write). It is never read after the release, because by then the block may hold
+  a replica a peer pushed back in the gap — recording *that* as the released revision would make the
+  sweep's written-again check compare a block against itself and delete bytes this node had just
+  accepted. Sourcing it from the confirm makes every write that lands after the confirm an advance, so a
+  block pushed back is kept.
 - **A block whose handoff never confirmed is never swept.** Nothing releases it, so nothing records
   it, so its bytes stay on this node — served, for ever. That is the safe direction, and it is also
   why the sweep cannot be relied on to free a node whose handoffs keep failing: see
@@ -392,7 +399,7 @@ coordinator rather than inline in `libp2p-node-base.ts`:
   about what a node takes, and it cannot roll a shift back.
 - `packages/db-p2p/src/cluster/block-transfer.ts` — `confirmReplicated(blockIds, owners, floor)` is
   the confirm primitive (pushes, counts holders reporting *not* `missing`, requires ≥ floor);
-  `handleRebalanceEvent` returns `{ released, retained, replicated, underReplicated, growth }` — release is gated on confirmation, and the last three report the cohort-growth push arm (nothing is ever released off it). `growth` carries a per-block `GrowthOutcome { satisfiedPeers, complete }` that the caller feeds back to `RebalanceMonitor.recordGrowthOutcome`, so a grown peer is recorded as holding the block only once a push to it is confirmed; a block the reaction had no information about has no entry and is re-detected next check.
+  `handleRebalanceEvent` returns `{ released, retained, releasedRevs, replicated, underReplicated, growth }` — release is gated on confirmation, `releasedRevs` carries the revision each released block was confirmed replicated at (what the ledger records), and the last three report the cohort-growth push arm (nothing is ever released off it). `growth` carries a per-block `GrowthOutcome { satisfiedPeers, complete }` that the caller feeds back to `RebalanceMonitor.recordGrowthOutcome`, so a grown peer is recorded as holding the block only once a push to it is confirmed; a block the reaction had no information about has no entry and is re-detected next check.
 - `packages/db-p2p/src/cluster/rebalance-monitor.ts` — `RebalanceEvent.newOwners` / `.grown` / `.floor`
   and the now-public `getCohortSize()` supply the post-move holders, the newly co-responsible peers of
   blocks that are KEPT, and floor `N`. `recordGrowthOutcome` consumes the reaction's growth feedback
@@ -402,6 +409,9 @@ coordinator rather than inline in `libp2p-node-base.ts`:
 - `packages/db-p2p/src/storage/released-block-ledger.ts` — the durable record of what Phase C and the
   confirmed rebalance release have released: `ReleasedBlockLedger.record` (the only writer, called from
   those two paths and nowhere else) and the per-entry revision the sweep's written-again check reads.
+  That revision is a **required argument** of `record`, supplied by the confirm step that made the
+  release decision; the ledger reads no metadata of its own, which is what keeps a revision pushed back
+  after the release from being recorded as the one released.
 - `packages/db-p2p/src/storage/released-block-sweep.ts` — `ReleasedBlockSweep.sweep` deletes what the
   ledger lists and nothing else, bounded per run, single-flight with one queued follow-on. The delete
   itself is `StorageRepo.deleteBlockIfNotAdvanced`, which takes the block's write latch and declines a

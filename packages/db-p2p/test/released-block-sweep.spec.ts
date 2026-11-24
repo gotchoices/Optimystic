@@ -44,13 +44,14 @@ describe('ReleasedBlockSweep — a delete a restart interrupted', () => {
 		await raw.saveMaterializedBlock(BLOCK_ID, ACTION_ID, blockOf(BLOCK_ID));
 		expect(await raw.getMetadata(BLOCK_ID), 'the interrupted delete took the metadata').to.equal(undefined);
 
-		// The entry that outlived the delete. Recorded through the real ledger over the real repo, so the
-		// revision it carries is what this node's metadata actually says — here nothing, which is the
-		// post-crash reading and must NOT make the sweep decline the block.
+		// The entry that outlived the delete, carrying no revision — the reading for a release whose
+		// confirm handed none over, and the one this post-crash state must produce: the metadata the
+		// interrupted delete took is exactly what nobody can report a revision from. It must NOT make the
+		// sweep decline the block.
 		const kv = new MemoryKVStore();
-		const ledger = new ReleasedBlockLedger(kv, { heldRevisions: blockIds => repo.heldRevisions(blockIds) });
-		const entries = await ledger.record([BLOCK_ID], 'ring-shift');
-		expect(entries[0]?.releasedRev, 'no revision is held, so the entry carries none').to.equal(undefined);
+		const ledger = new ReleasedBlockLedger(kv);
+		const entries = await ledger.record([BLOCK_ID], 'ring-shift', new Map());
+		expect(entries[0]?.releasedRev, 'no revision was handed over, so the entry carries none').to.equal(undefined);
 
 		const sweep = new ReleasedBlockSweep({ ledger, storage: repo, log: createLogger('storage:released') });
 		const run = await sweep.sweep();
