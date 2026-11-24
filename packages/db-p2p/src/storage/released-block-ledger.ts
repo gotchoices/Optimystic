@@ -37,12 +37,12 @@ const log = createLogger('storage:released');
  */
 export const RELEASED_BLOCK_KEY_PREFIX = 'optimystic-released/';
 
-// NOTE: a block id is used raw in the key, and `FileKVStore.keyToPath` joins a key's segments onto its
-// base path — so an id containing `..` segments would address a file outside this namespace, the class
-// the backlog ticket `bug-a-block-id-is-used-as-a-file-path-without-validation` owns. No guard is added
-// here on purpose: `FileBatchBackend.blockPath` already refuses such an id at the storage boundary, so
-// a block with one cannot be stored, cannot be owned, and so cannot be released. Validate at that one
-// boundary when the ticket lands rather than growing a second ad-hoc check here.
+// NOTE: accepted tradeoff — a block id is used raw in the key, and `FileKVStore.keyToPath` joins a
+// key's segments onto its base path, so an id containing `..` segments would address a file outside
+// this namespace. No guard is added here on purpose: `KvRawStorage` asserts `isValidBlockId` on every
+// block id it is given (see that class's comment), so a block with one cannot be stored, cannot be
+// owned, and so cannot be released. One enforcement point rather than a second ad-hoc check here.
+// Revisit if a path is ever built from a block id that did NOT come through block storage.
 
 /** Which confirmed release wrote the entry — for an operator reading the ledger, and for the run log. */
 export type ReleaseSource =

@@ -358,11 +358,13 @@ describe('FileRawStorage.listBlockIds', () => {
 	});
 });
 
-// `deleteBlock` removes the block's directory RECURSIVELY and a block id is used raw as a relative
-// path, so an id resolving onto the store root or above it would take the whole store — the
-// write-ahead log and the lock with it — or a directory the store does not own at all. Nothing
-// upstream validates a block id (`BlockId` is a bare string, and `StorageRepo` builds a
-// `BlockStorage` for whatever ids a peer names), so this guard is the only thing standing in the way.
+// `deleteBlock` removes the block's directory RECURSIVELY, so an id resolving onto the store root or
+// above it would take the whole store — the write-ahead log and the lock with it — or a directory the
+// store does not own at all. The REFUSAL now comes from `KvRawStorage.checkedId` (Invariant 7 in
+// `packages/db-p2p/docs/storage.md`), which is why the assertion below matches that error's wording
+// and not `FileBatchBackend.blockPath`'s; the backend's own guard survives underneath it as a
+// backstop for a backend driven without the kernel, and asserting on the kernel's message is what
+// keeps these cases honest about which guard actually fires on the node path.
 describe('FileRawStorage.deleteBlock refuses an id outside the store', () => {
 	let base: string;
 	const stores = trackedStores();
@@ -386,7 +388,7 @@ describe('FileRawStorage.deleteBlock refuses an id outside the store', () => {
 
 			await assert.rejects(
 				() => storage.deleteBlock(blockId as BlockId),
-				/does not name a directory inside/,
+				/does not name a location inside the store/,
 			);
 
 			// Nothing was removed and no log record was appended for the refused id: the store's own
@@ -396,6 +398,48 @@ describe('FileRawStorage.deleteBlock refuses an id outside the store', () => {
 			assert.strictEqual(await storage.getMetadata('held' as BlockId), undefined);
 		});
 	}
+});
+
+// What the kernel's refusal (Invariant 7) is worth on disk. The shared conformance suite asserts that
+// an escaping id is refused and the store survives it; only this backend can say that nothing landed
+// outside its directory, which is the actual harm — before the check, a pend named `../escaped` wrote
+// `<root>/escaped/pend/<actionId>.json`, a sibling of the store, because the action-scoped write path
+// is built by `relativeActionScopedPath` and never passed through `FileBatchBackend.blockPath`.
+describe('FileRawStorage writes nothing outside its directory for an escaping block id', () => {
+	let root: string;
+	let base: string;
+	const stores = trackedStores();
+
+	beforeEach(async () => {
+		root = await fs.mkdtemp(path.join(os.tmpdir(), 'optimystic-fs-escape-'));
+		base = path.join(root, 'store');
+		await fs.mkdir(base);
+	});
+
+	afterEach(async () => {
+		await stores.closeAll();
+		await fs.rm(root, { recursive: true, force: true });
+	});
+
+	it('a refused pend leaves the store`s parent untouched and names nothing in the log', async () => {
+		const storage = stores.open(base);
+		const transform: Transform = { insert: { header: { id: 'held' as BlockId, type: 'test', collectionId: 'c1' as BlockId } } as IBlock };
+
+		// A legitimate write first: it opens the store, so the log exists to be inspected below.
+		await storage.savePendingTransaction('held' as BlockId, 'tx-ok' as ActionId, transform);
+		await storage.flush();
+
+		await assert.rejects(
+			() => storage.savePendingTransaction('../escaped' as BlockId, 'tx-abc' as ActionId, transform),
+			/does not name a location inside the store/,
+		);
+		await storage.flush();
+
+		assert.deepStrictEqual(await fs.readdir(root), ['store'], 'nothing was created beside the store');
+		// And no record names it, so no later replay can create it either.
+		const records = decodeWriteLog(await fs.readFile(path.join(base, WRITE_LOG_FILENAME))).batches;
+		assert.deepStrictEqual(records.map(batch => batch.map(entry => entry.path)), [['held/pend/tx-ok.json']]);
+	});
 });
 
 describe('FileKVStore over the write-ahead log', () => {

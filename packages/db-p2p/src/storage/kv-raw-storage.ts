@@ -1,4 +1,4 @@
-import { LruMap, type BlockId, type ActionId, type ActionRev, type Transform, type IBlock } from "@optimystic/db-core";
+import { LruMap, assertValidBlockId, type BlockId, type ActionId, type ActionRev, type Transform, type IBlock } from "@optimystic/db-core";
 import type { BlockCommitProof } from "../cluster/commit-proof.js";
 import { createLogger } from "../logger.js";
 import type { BlockMetadata } from "./struct.js";
@@ -38,6 +38,30 @@ function isProofRef(entry: StoredProofEntry): entry is ProofRef {
  * layout / storage topology stays in the driver, because the backends do NOT
  * share one — LevelDB is a single ordered byte keyspace, SQLite seven relational
  * tables, IndexedDB seven object stores, the filesystem a directory tree.
+ *
+ * **It is also where a block id is checked.** A block id is chosen by whoever originates a write,
+ * including a peer across the network, and the filesystem backend uses it raw as a relative path, so
+ * an unchecked id lets a peer make this node write outside its own store. Every method here that
+ * takes a `blockId` passes it through {@link checkedId} before it reaches the driver — reads
+ * included, so an id outside the store cannot be read either. The rule itself is `isValidBlockId`
+ * in db-core; this is its single enforcement point, which is what lets every key and path builder
+ * below the driver boundary trust the id it is given. The check, which deliberately matches the
+ * call shape (the escapes keep this very comment from matching):
+ *
+ * >     grep -rnE "this\.driver\.[a-zA-Z]+\(blockId" packages/db-p2p/src
+ *
+ * That must return nothing — every forward below names `this.checkedId(blockId)`. A hit means a
+ * method has started handing the driver an unchecked id. The complementary check, that nothing
+ * serves an `IRawStorage` WITHOUT passing through this kernel:
+ *
+ * >     grep -rnE "implements\s+IRawStorage" --include=*.ts --exclude-dir=dist --exclude-dir=test packages
+ *
+ * That must return exactly one line — this class. Every shipping backend (`MemoryRawStorage`,
+ * `FileRawStorage`, `IndexedDBRawStorage`, `LevelDBRawStorage`, `SqliteRawStorage`) and the read
+ * cache `extends` it rather than implementing the interface itself, so there is no composition on a
+ * node path that reaches a driver around the check. A driver or `BatchBackend` constructed and
+ * driven directly — only specs do that today — is outside it, which is fine where the spec names
+ * its own ids.
  */
 export class KvRawStorage<V extends StoredValue = Uint8Array> implements IRawStorage {
 	/**
@@ -100,10 +124,23 @@ export class KvRawStorage<V extends StoredValue = Uint8Array> implements IRawSto
 		}
 	}
 
+	/**
+	 * The id, once it is known to name a location inside the store; see `isValidBlockId` in db-core
+	 * for the rule and the class comment above for why this is the one place it is applied. Called
+	 * before the driver is touched, so a refused id rejects that one call and leaves the store usable
+	 * — a throw from inside a write group would instead latch the store failed and refuse every later
+	 * write until it is reopened (the flush contract's rule 5, `RawStoreDriver.flush`), which is
+	 * exactly what a peer naming a bad id must not be able to do to a node.
+	 */
+	private checkedId(blockId: BlockId): BlockId {
+		assertValidBlockId(blockId);
+		return blockId;
+	}
+
 	// --- Metadata ---
 
 	async getMetadata(blockId: BlockId): Promise<BlockMetadata | undefined> {
-		const value = await this.driver.getMetadata(blockId);
+		const value = await this.driver.getMetadata(this.checkedId(blockId));
 		return value === undefined ? undefined : this.codec.decodeJson<BlockMetadata>(value);
 	}
 
@@ -118,18 +155,18 @@ export class KvRawStorage<V extends StoredValue = Uint8Array> implements IRawSto
 	// future option only if TTL staleness ever proves insufficient; do NOT
 	// implement it here — leave the write path a single seam.
 	async saveMetadata(blockId: BlockId, metadata: BlockMetadata): Promise<void> {
-		await this.driver.putMetadata(blockId, this.codec.encodeJson(metadata));
+		await this.driver.putMetadata(this.checkedId(blockId), this.codec.encodeJson(metadata));
 	}
 
 	// --- Revisions ---
 
 	async getRevision(blockId: BlockId, rev: number): Promise<ActionId | undefined> {
-		const value = await this.driver.getRevision(blockId, rev);
+		const value = await this.driver.getRevision(this.checkedId(blockId), rev);
 		return value === undefined ? undefined : this.codec.decodeActionId(value);
 	}
 
 	async saveRevision(blockId: BlockId, rev: number, actionId: ActionId): Promise<void> {
-		await this.driver.putRevision(blockId, rev, this.codec.encodeActionId(actionId));
+		await this.driver.putRevision(this.checkedId(blockId), rev, this.codec.encodeActionId(actionId));
 	}
 
 	async *listRevisions(blockId: BlockId, startRev: number, endRev: number): AsyncIterable<ActionRev> {
@@ -139,7 +176,7 @@ export class KvRawStorage<V extends StoredValue = Uint8Array> implements IRawSto
 		const ascending = startRev <= endRev;
 		const lo = ascending ? startRev : endRev;
 		const hi = ascending ? endRev : startRev;
-		for await (const [rev, value] of this.driver.rangeRevisions(blockId, lo, hi, !ascending)) {
+		for await (const [rev, value] of this.driver.rangeRevisions(this.checkedId(blockId), lo, hi, !ascending)) {
 			yield { rev, actionId: this.codec.decodeActionId(value) };
 		}
 	}
@@ -147,31 +184,31 @@ export class KvRawStorage<V extends StoredValue = Uint8Array> implements IRawSto
 	// --- Pending transactions ---
 
 	async getPendingTransaction(blockId: BlockId, actionId: ActionId): Promise<Transform | undefined> {
-		const value = await this.driver.getPending(blockId, actionId);
+		const value = await this.driver.getPending(this.checkedId(blockId), actionId);
 		return value === undefined ? undefined : this.codec.decodeJson<Transform>(value);
 	}
 
 	async savePendingTransaction(blockId: BlockId, actionId: ActionId, transform: Transform): Promise<void> {
-		await this.driver.putPending(blockId, actionId, this.codec.encodeJson(transform));
+		await this.driver.putPending(this.checkedId(blockId), actionId, this.codec.encodeJson(transform));
 	}
 
 	async deletePendingTransaction(blockId: BlockId, actionId: ActionId): Promise<void> {
-		await this.driver.deletePending(blockId, actionId);
+		await this.driver.deletePending(this.checkedId(blockId), actionId);
 	}
 
 	async *listPendingTransactions(blockId: BlockId): AsyncIterable<ActionId> {
-		yield* this.driver.listPendingActionIds(blockId);
+		yield* this.driver.listPendingActionIds(this.checkedId(blockId));
 	}
 
 	// --- Committed transactions ---
 
 	async getTransaction(blockId: BlockId, actionId: ActionId): Promise<Transform | undefined> {
-		const value = await this.driver.getTransaction(blockId, actionId);
+		const value = await this.driver.getTransaction(this.checkedId(blockId), actionId);
 		return value === undefined ? undefined : this.codec.decodeJson<Transform>(value);
 	}
 
 	async saveTransaction(blockId: BlockId, actionId: ActionId, transform: Transform): Promise<void> {
-		await this.driver.putTransaction(blockId, actionId, this.codec.encodeJson(transform));
+		await this.driver.putTransaction(this.checkedId(blockId), actionId, this.codec.encodeJson(transform));
 	}
 
 	// --- Commit proofs (their OWN (blockId, rev)-keyed store — see RawStoreDriver.getProof) ---
@@ -213,12 +250,12 @@ export class KvRawStorage<V extends StoredValue = Uint8Array> implements IRawSto
 	}
 
 	async getProofEntry(blockId: BlockId, rev: number): Promise<StoredProofEntry | undefined> {
-		const value = await this.driver.getProof(blockId, rev);
+		const value = await this.driver.getProof(this.checkedId(blockId), rev);
 		return value === undefined ? undefined : this.codec.decodeJson<StoredProofEntry>(value);
 	}
 
 	async saveProofEntry(blockId: BlockId, rev: number, entry: StoredProofEntry): Promise<void> {
-		await this.driver.putProof(blockId, rev, this.codec.encodeJson(entry));
+		await this.driver.putProof(this.checkedId(blockId), rev, this.codec.encodeJson(entry));
 	}
 
 	/** Resolves once the commit proofs store holds a proof under `proof.messageHash`; see {@link storedCommitProofs}. */
@@ -269,23 +306,23 @@ export class KvRawStorage<V extends StoredValue = Uint8Array> implements IRawSto
 	// --- Materialized blocks ---
 
 	async getMaterializedBlock(blockId: BlockId, actionId: ActionId): Promise<IBlock | undefined> {
-		const value = await this.driver.getMaterialized(blockId, actionId);
+		const value = await this.driver.getMaterialized(this.checkedId(blockId), actionId);
 		return value === undefined ? undefined : this.codec.decodeJson<IBlock>(value);
 	}
 
 	async saveMaterializedBlock(blockId: BlockId, actionId: ActionId, block?: IBlock): Promise<void> {
 		// Present ⇒ put the materialized block; absent ⇒ delete (tombstone / truncation).
 		if (block) {
-			await this.driver.putMaterialized(blockId, actionId, this.codec.encodeJson(block));
+			await this.driver.putMaterialized(this.checkedId(blockId), actionId, this.codec.encodeJson(block));
 		} else {
-			await this.driver.deleteMaterialized(blockId, actionId);
+			await this.driver.deleteMaterialized(this.checkedId(blockId), actionId);
 		}
 	}
 
 	// --- Promote (the only cross-key atomic op; driver owns atomicity) ---
 
 	async promotePendingTransaction(blockId: BlockId, actionId: ActionId): Promise<void> {
-		await this.driver.promote(blockId, actionId);
+		await this.driver.promote(this.checkedId(blockId), actionId);
 	}
 
 	// --- Delete a whole block (the driver owns the ordering; see RawStoreDriver.deleteBlock) ---
@@ -307,7 +344,7 @@ export class KvRawStorage<V extends StoredValue = Uint8Array> implements IRawSto
 	 * `packages/db-p2p/docs/storage.md` § *Deleting a block*.
 	 */
 	async deleteBlock(blockId: BlockId): Promise<void> {
-		await this.driver.deleteBlock(blockId);
+		await this.driver.deleteBlock(this.checkedId(blockId));
 	}
 
 	// --- Flush (what a flush does is the driver's; see RawStoreDriver.flush for the contract) ---

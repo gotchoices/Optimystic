@@ -1,4 +1,11 @@
-export type BlockId = string;	// base64url encoded (256-bit random)
+/**
+ * The domain-wide name of one block. Either a base64url-encoded random id (256-bit, what a writer
+ * mints for an ordinary block) or a human-named `/`-separated collection path such as
+ * `default/app/Ledger` — a store may lay the latter out as nested directories. Not every string is
+ * one: see `isValidBlockId` in `block-id.ts` for the rule, and `assertValidBlockId` for where it is
+ * enforced.
+ */
+export type BlockId = string;
 export type BlockType = string;	// Generally a short code
 
 export type BlockHeader = {

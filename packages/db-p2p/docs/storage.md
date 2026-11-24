@@ -31,7 +31,7 @@ of this doc) is complete.
 
 ## Invariants
 
-These six properties are what make it safe to build another layer (e.g. a
+These seven properties are what make it safe to build another layer (e.g. a
 cache) over `IRawStorage`. Each entry states the rule, where it's enforced, and
 what breaks if it's violated.
 
@@ -732,6 +732,22 @@ lands, and
 [docs/correctness.md §1.2](../../../docs/correctness.md#12-nodes) with it. The browser row rests
 on what a browser does with `durability: 'strict'`; nothing in this repository cuts the power, so
 the package's tests check which durability each transaction asked for and no more.
+
+### 7. A block id reaching a backend names a location inside the store
+
+A block id is the name of one stored item, and the filesystem backend uses it **raw as a relative path**: the block `default/app/Ledger` lives in `<store>/default/app/Ledger/`. Nested, human-named collection ids like that are deliberate and must keep working. What must not reach a backend is an id that names somewhere else:
+
+> A block id that reaches a `RawStoreDriver` is a non-empty string, free of control characters and of backslashes, not starting with a Windows drive prefix, and every one of its `/`-separated segments is non-empty and is neither `.` nor `..`.
+
+The rule is stated once, in `isValidBlockId` (`packages/db-core/src/blocks/block-id.ts`), beside the reason each clause is there — the backslash clause is a win32 path separator, the drive-prefix clause is an id that means two different places on the two platforms, and the segment clause rejects both escape (`..`) and aliasing (`a//b`, `./a`).
+
+**Where it's enforced:** `KvRawStorage` (`packages/db-p2p/src/storage/kv-raw-storage.ts`), which calls `assertValidBlockId` through its `checkedId` helper on every method that takes a block id — reads included, so an id outside the store cannot be read either. That is the single enforcement point: every shipping backend extends this kernel (the `implements IRawStorage` check in its class comment), so no node path reaches a driver around it, and every key and path builder below is free to trust the id it is given. The check sits ABOVE the write group on purpose: a throw from inside a `commit` is a storage fault and latches the store failed (rule 5 of the flush contract under Invariant 6), so refusing the id before the driver records anything rejects that one call and leaves the store usable.
+
+Two guards remain below it, each for its own reason and neither a second owner of the rule. `FileBatchBackend`'s `blockPath` still refuses an escaping id, because `deleteBlock` removes that directory recursively and the blast radius — the store root, the write-ahead log and the lock — justifies belt and braces for a backend driven without the kernel. And `FileWriteLog`'s `applyBatch` (`packages/db-p2p-storage-fs/src/file-write-log.ts`) refuses a *recorded relative path* that does not resolve inside the store: a store written by a build from before this invariant can hold a log record naming `../escaped/...`, and a log is replayed on every open until a checkpoint truncates it, so that is the one place a pre-invariant id survives the upgrade. It also contains a log damaged or forged on disk. Such a record ends the replay where it sits, exactly as a record the decode cannot trust does, and the store opens and serves normally.
+
+**Violate it and:** a peer chooses where this node writes. `StorageRepo` builds a `BlockStorage` for whatever id a request names, so a peer naming a block `../escaped` made this node write a file outside its own store — anywhere the process has permission to write. Aliasing ids are the quieter half: two spellings of one location (`a/b` and `a//b`) would look like two blocks and share one directory.
+
+**What this does NOT address.** An id that aliases another block's *store* directory — `x/revs`, or `x/blocks/y` where `x` is also a block — is inside the store and passes the rule; those are the separate limits of the raw-id layout noted at `BLOCK_STORE_DIRS` and on `deleteBlock` in `packages/db-p2p-storage-fs/src/file-batch-backend.ts`. Retiring them means encoding block-id segments in the layout, which would change every on-disk store.
 
 ## Core Components
 

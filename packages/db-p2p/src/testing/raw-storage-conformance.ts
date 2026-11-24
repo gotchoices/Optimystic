@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import type { BlockId, ActionId, IBlock, BlockHeader, Transform, Transforms } from '@optimystic/db-core';
+import { InvalidBlockIdError, type BlockId, type ActionId, type IBlock, type BlockHeader, type Transform, type Transforms } from '@optimystic/db-core';
 import type { BlockCommitProof } from '../cluster/commit-proof.js';
 import type { IRawStorage } from '../storage/i-raw-storage.js';
 import type { BlockMetadata } from '../storage/struct.js';
@@ -72,6 +72,16 @@ async function collect<T>(iter: AsyncIterable<T>): Promise<T[]> {
 	const out: T[] = [];
 	for await (const item of iter) out.push(item);
 	return out;
+}
+
+/** The error `work` rejected with, or `undefined` when it resolved. */
+async function rejection(work: Promise<unknown>): Promise<unknown> {
+	try {
+		await work;
+		return undefined;
+	} catch (err) {
+		return err;
+	}
 }
 
 /**
@@ -534,6 +544,30 @@ export function runRawStorageConformance(
 
 			// A block this store has never held: quiet success, not a throw.
 			await storage.deleteBlock('del-never-seen' as BlockId);
+		});
+
+		// --- Block ids (Invariant 7; the rule's own edges are pinned in db-core's block-id.spec.ts) ---
+
+		// One id for every backend, because the enforcement is shared (`KvRawStorage.checkedId`) and
+		// the point here is the CONSEQUENCE: the write is refused and the store is still usable.
+		// Refusing above the write group is what buys the second half — a throw from inside a commit
+		// would latch the store failed and refuse every later write, which is exactly what a peer
+		// naming `../escaped` must not be able to do to a node.
+		it('refuses a write under a block id that names a location outside the store, and stays usable', async () => {
+			const escaping = '../escaped' as BlockId;
+			const transform: Transform = { insert: makeBlock('escaped') };
+			const meta: BlockMetadata = { ranges: [[1, 1]], latest: { rev: 1, actionId: 'a1' as ActionId } };
+
+			const refused = await rejection(storage.savePendingTransaction(escaping, 'tx-abc' as ActionId, transform));
+			expect(refused, 'a pend under an escaping id is refused').to.be.instanceOf(InvalidBlockIdError);
+			expect(await rejection(storage.getMetadata(escaping)), 'a READ of the id is refused too')
+				.to.be.instanceOf(InvalidBlockIdError);
+
+			// The refusal cost the store nothing: a later write is taken and read back. Were the check
+			// inside the write group instead, the store would have latched failed and refused this.
+			await storage.saveMetadata('kept' as BlockId, meta);
+			await storage.flush();
+			expect(await storage.getMetadata('kept' as BlockId), 'the store took a later write').to.deep.equal(meta);
 		});
 
 		// --- Clone-on-store / clone-on-read (now structural via the byte boundary) ---

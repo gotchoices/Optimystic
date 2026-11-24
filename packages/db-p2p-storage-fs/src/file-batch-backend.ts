@@ -461,18 +461,17 @@ export class FileBatchBackend implements BatchBackend {
 	}
 
 	/**
-	 * The block's directory, refusing an id that does not name one strictly INSIDE the store. A block
-	 * id is used raw as a relative path, so `..`, an absolute id and the empty id all resolve outside
-	 * (or onto) `basePath` — and {@link deleteBlock} removes this directory recursively, so an id
-	 * resolving to the store root or above it would take the whole store, the write-ahead log and the
-	 * lock with it, or a directory the store does not own at all. Nothing validates a block id
-	 * anywhere in the system (`BlockId` is a bare `string`, and `StorageRepo` builds a `BlockStorage`
-	 * for whatever ids a peer names), so the check belongs where the path is built.
+	 * The block's directory, refusing an id that does not name one strictly INSIDE the store.
 	 *
-	 * This covers every path built from a block's directory — metadata, revisions, proofs and the
-	 * pending listing. It does NOT cover the action-scoped paths or the write-ahead log's replay,
-	 * which build their own relative strings: see the backlog ticket
-	 * `bug-a-block-id-is-used-as-a-file-path-without-validation` for retiring the class.
+	 * The RULE for block ids is not owned here: it is `isValidBlockId` in db-core, enforced by
+	 * `KvRawStorage` on every id it is given before the id reaches any backend (see that class's
+	 * comment). Every other path builder in this file trusts its input on the strength of that.
+	 *
+	 * This one guard stays as a backstop, because of what it protects: {@link deleteBlock} removes
+	 * this directory RECURSIVELY, so an id resolving onto the store root or above it would take the
+	 * whole store, the write-ahead log and the lock with it, or a directory the store does not own at
+	 * all. That blast radius is worth belt and braces for a backend driven directly in a spec, or by
+	 * a future caller that reaches a `BatchBackend` without the kernel above it.
 	 */
 	private blockPath(blockId: BlockId): string {
 		const resolved = path.resolve(this.basePath, blockId);

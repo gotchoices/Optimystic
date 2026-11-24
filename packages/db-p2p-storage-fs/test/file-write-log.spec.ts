@@ -137,6 +137,35 @@ describe('FileWriteLog replay', () => {
 		});
 	});
 
+	// A store written by a build from BEFORE block ids were validated (Invariant 7 in
+	// `packages/db-p2p/docs/storage.md`) can hold a record naming a path outside the store. The log is
+	// replayed on every open until a checkpoint truncates it, so without this guard the escaped write
+	// would be re-created after every restart — the one place a pre-fix block id survives the upgrade.
+	// A forged or damaged log gets the same treatment.
+	it('refuses a record naming a path outside the store, and the store opens and serves normally', async () => {
+		const store = path.join(base, 'store');
+		await fs.mkdir(store);
+		await fs.writeFile(path.join(store, WRITE_LOG_FILENAME), Buffer.concat([
+			Buffer.from(WRITE_LOG_HEADER),
+			Buffer.from(encodeWriteLogRecord([put('blk/meta.json', 'one')])),
+			Buffer.from(encodeWriteLogRecord([put('../escaped/pend/tx-abc.json', 'escaped')])),
+			Buffer.from(encodeWriteLogRecord([put('blk/revs/3.json', 'three')])),
+		]));
+
+		await withLog(store, async log => {
+			await log.open();
+			assert.strictEqual(await readText(base, 'escaped/pend/tx-abc.json'), undefined, 'nothing was applied outside the store');
+			assert.strictEqual(await readText(store, 'blk/meta.json'), 'one', 'the record before the escaping one applied');
+			assert.strictEqual(await readText(store, 'blk/revs/3.json'), undefined, 'the intact record after it is discarded');
+
+			// The open succeeded and the log is usable: a commit lands, and the escaped record is gone
+			// for good because the open truncated the log to its header.
+			const { durable } = await log.commit([put('blk/revs/4.json', 'four')], STRICT);
+			await durable;
+			assert.strictEqual(await readText(store, 'blk/revs/4.json'), 'four');
+		});
+	});
+
 	// A store written by a build before the log (a tree and no log file) is opened by
 	// `packages/upgrade-check` over the fixtures real older releases wrote, so no case here restates it.
 	it('a file that is not a write-ahead log replays nothing and is replaced by a fresh header', async () => {

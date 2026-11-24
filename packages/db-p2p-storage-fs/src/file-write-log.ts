@@ -104,6 +104,19 @@ function encodePayload(entries: readonly WriteLogEntry[]): Uint8Array {
 /** Why a strict read of the log stopped before the end of the file. */
 export type WriteLogStop = 'bad-header' | 'torn-record' | 'crc-mismatch' | 'bad-entry';
 
+/**
+ * A record named a path that does not resolve inside the store's directory; see
+ * `FileWriteLog.containedTarget`. Thrown rather than returned because the apply path is shared with
+ * a live commit, where it cannot happen and latching the log is the right reaction if it somehow
+ * does; a replay catches it and ends there (see `FileWriteLog.replaySegment`).
+ */
+class WriteLogEscapedPathError extends Error {
+	constructor(basePath: string, readonly entryPath: string) {
+		super(`write-ahead log record names ${JSON.stringify(entryPath)}, which is not inside ${basePath}`);
+		this.name = 'WriteLogEscapedPathError';
+	}
+}
+
 export interface DecodedWriteLog {
 	/** Every batch read, in log order. */
 	readonly batches: readonly (readonly WriteLogEntry[])[];
@@ -628,7 +641,16 @@ export class FileWriteLog {
 		}
 	}
 
-	/** Apply one log file's intact records, in order, into `touched`. */
+	/**
+	 * Apply one log file's intact records, in order, into `touched`.
+	 *
+	 * A record naming a path outside the store ends the segment exactly as a record the decode could
+	 * not trust does — what precedes it applied, the rest discarded — so an upgraded store with such
+	 * a record in its log opens and serves normally, and loses the record for good when the open
+	 * truncates the current log. For the SEALED segment that costs the current log's records too,
+	 * which is the same bargain the NOTE in {@link replay} already states for a damaged sealed
+	 * segment.
+	 */
 	private async replaySegment(filePath: string, touched: DirtyPaths): Promise<'absent' | 'complete' | 'stopped-short'> {
 		// NOTE: a log file is read into memory for one decode. The current log reaches about twice
 		// `checkpointBytes` at most — past `checkpointBytes` with the checkpoint before it still
@@ -639,8 +661,16 @@ export class FileWriteLog {
 		const bytes = await readFileIfExists(filePath);
 		if (bytes === undefined) return 'absent';
 		const decoded = decodeWriteLog(bytes);
+		let applied = 0;
 		for (const batch of decoded.batches) {
-			await this.applyBatch(batch, touched);
+			try {
+				await this.applyBatch(batch, touched);
+			} catch (err) {
+				if (!(err instanceof WriteLogEscapedPathError)) throw err;
+				log('replay of %s stopped at record %d of %d: %s', filePath, applied + 1, decoded.batches.length, err.message);
+				return 'stopped-short';
+			}
+			applied++;
 		}
 		if (!decoded.stoppedBy) return 'complete';
 		log('replay of %s stopped at byte %d of %d (%s): %d batch(es) before it applied, the rest discarded',
@@ -739,8 +769,11 @@ export class FileWriteLog {
 	 * 5 already excludes. If that shape is ever supported, write through a temp file and rename.
 	 */
 	private async applyBatch(entries: readonly WriteLogEntry[], touched: DirtyPaths): Promise<void> {
-		for (const entry of entries) {
-			const target = path.join(this.basePath, entry.path);
+		// Every path first, nothing applied yet: a record naming a path outside the store applies none
+		// of itself, exactly as a torn or CRC-bad record does.
+		const targets = entries.map(entry => this.containedTarget(entry.path));
+		for (const [index, entry] of entries.entries()) {
+			const target = targets[index]!;
 			const dir = path.dirname(target);
 			if (entry.kind === 'put') {
 				const created = await fs.mkdir(dir, { recursive: true });
@@ -753,6 +786,26 @@ export class FileWriteLog {
 			}
 			touched.directories.add(dir);
 		}
+	}
+
+	/**
+	 * The absolute path a record's relative path names, refusing one that does not resolve strictly
+	 * inside the store.
+	 *
+	 * This guards a RECORDED PATH, not a block id: the rule for block ids is `isValidBlockId` and
+	 * `KvRawStorage` applies it before any id reaches a backend, so nothing this build writes can
+	 * produce an escaping record. Two things still can. A store written by a build from BEFORE that
+	 * check can hold a log record naming `../escaped/...`, and a log is replayed on every open until
+	 * a checkpoint truncates it, so the escaped write would be re-applied after every restart — the
+	 * one place a pre-fix block id survives the upgrade. And a log file damaged or forged on disk can
+	 * name anything; the CRC catches damage but not a record someone wrote on purpose.
+	 */
+	private containedTarget(entryPath: string): string {
+		const target = path.resolve(this.basePath, entryPath);
+		if (!target.startsWith(this.basePath + path.sep)) {
+			throw new WriteLogEscapedPathError(this.basePath, entryPath);
+		}
+		return target;
 	}
 
 	/**
