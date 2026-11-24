@@ -165,14 +165,15 @@ export class MemoryStoreDriver implements RawStoreDriver {
 	 * `durability` `'none'` there is nothing to make durable. Idempotent: a missing key deletes
 	 * nothing.
 	 */
-	// NOTE: the key-scoped maps are matched by the `${blockId}:` prefix, and this driver's keys are
-	// not length-prefixed, so block `a`'s prefix also matches block `a:b`'s keys and this takes them
-	// too. That is the SAME accepted limit the filesystem backend's raw-id directory layout carries
-	// (`BLOCK_STORE_DIRS` in `packages/db-p2p-storage-fs/src/file-batch-backend.ts`): a block nested
-	// inside another is removed with it. Reachable only by deleting an outer block while keeping an
-	// inner one, which the responsibility ranges a sweep works from do not produce — a nested id
-	// shares its parent's key prefix, so both fall in the same released range.
-	// The batch backends do key unambiguously, through `canonicalStoreKey`'s length prefix.
+	// NOTE: the key-scoped maps are matched by the `${blockId}:` prefix, which is not length-prefixed,
+	// so block `a`'s prefix also matches block `a:b`'s keys and this would take them too. That needs a
+	// block id CONTAINING A COLON, and none does: ids are base64url, or `/`-separated names like
+	// `default/app/Ledger`, whose nested child `default/app/Ledger/index` keys as
+	// `default/app/Ledger/index:<rev>` and so does NOT match `default/app/Ledger:`. The `/`-nesting
+	// hazard the filesystem backend's raw-id directory layout really has (`BLOCK_STORE_DIRS` in
+	// `packages/db-p2p-storage-fs/src/file-batch-backend.ts`) is therefore NOT shared here — do not
+	// read the two as one limit. If a block id ever carries a colon, key these maps through
+	// `canonicalStoreKey`, which length-prefixes as the batch backends do.
 	async deleteBlock(blockId: BlockId): Promise<void> {
 		this.metadata.delete(blockId);
 		const prefix = `${blockId}:`;

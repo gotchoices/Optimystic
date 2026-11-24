@@ -382,11 +382,16 @@ export class FileBatchBackend implements BatchBackend {
 	// yields nothing, so it costs an inode and no correctness. If a store ever accumulates many empty
 	// prefix directories, prune upward to the first non-empty ancestor.
 	async deleteBlock(blockId: BlockId): Promise<void> {
+		// Resolved and checked BEFORE anything is written: the metadata unlink's log path is built
+		// from the raw id by `relativePath`, so an id naming a location outside the store has to be
+		// refused before any record names it, not just before the recursive remove. See
+		// {@link blockPath}.
+		const blockDir = this.blockPath(blockId);
 		await this.open();
 		const { durable } = await this.commit([{ key: { store: 'metadata', blockId } }], { syncWithinMs: 0 });
 		await durable;
 		await this.shared().checkpoint();
-		await fs.rm(this.blockPath(blockId), { recursive: true, force: true });
+		await fs.rm(blockDir, { recursive: true, force: true });
 	}
 
 	async close(): Promise<void> {
@@ -455,8 +460,26 @@ export class FileBatchBackend implements BatchBackend {
 		return `${blockId}/${ACTION_SCOPED_DIRS[store]}/${filename}.json`;
 	}
 
+	/**
+	 * The block's directory, refusing an id that does not name one strictly INSIDE the store. A block
+	 * id is used raw as a relative path, so `..`, an absolute id and the empty id all resolve outside
+	 * (or onto) `basePath` — and {@link deleteBlock} removes this directory recursively, so an id
+	 * resolving to the store root or above it would take the whole store, the write-ahead log and the
+	 * lock with it, or a directory the store does not own at all. Nothing validates a block id
+	 * anywhere in the system (`BlockId` is a bare `string`, and `StorageRepo` builds a `BlockStorage`
+	 * for whatever ids a peer names), so the check belongs where the path is built.
+	 *
+	 * This covers every path built from a block's directory — metadata, revisions, proofs and the
+	 * pending listing. It does NOT cover the action-scoped paths or the write-ahead log's replay,
+	 * which build their own relative strings: see the backlog ticket
+	 * `bug-a-block-id-is-used-as-a-file-path-without-validation` for retiring the class.
+	 */
 	private blockPath(blockId: BlockId): string {
-		return path.join(this.basePath, blockId);
+		const resolved = path.resolve(this.basePath, blockId);
+		if (!resolved.startsWith(this.basePath + path.sep)) {
+			throw new Error(`block id ${JSON.stringify(blockId)} does not name a directory inside ${this.basePath}`);
+		}
+		return resolved;
 	}
 
 	private metadataPath(blockId: BlockId): string {

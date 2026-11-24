@@ -358,6 +358,46 @@ describe('FileRawStorage.listBlockIds', () => {
 	});
 });
 
+// `deleteBlock` removes the block's directory RECURSIVELY and a block id is used raw as a relative
+// path, so an id resolving onto the store root or above it would take the whole store — the
+// write-ahead log and the lock with it — or a directory the store does not own at all. Nothing
+// upstream validates a block id (`BlockId` is a bare string, and `StorageRepo` builds a
+// `BlockStorage` for whatever ids a peer names), so this guard is the only thing standing in the way.
+describe('FileRawStorage.deleteBlock refuses an id outside the store', () => {
+	let base: string;
+	const stores = trackedStores();
+
+	beforeEach(async () => {
+		base = await fs.mkdtemp(path.join(os.tmpdir(), 'optimystic-fs-deleteblock-'));
+	});
+
+	afterEach(async () => {
+		await stores.closeAll();
+		await fs.rm(base, { recursive: true, force: true });
+	});
+
+	const meta: BlockMetadata = { latest: { rev: 1, actionId: 'tx:a1' as ActionId }, ranges: [[1, 1]] };
+
+	for (const blockId of ['..', '', '../sibling', 'held/../..', path.resolve(os.tmpdir(), 'optimystic-fs-elsewhere')]) {
+		it(`rejects ${JSON.stringify(blockId)} and writes nothing`, async () => {
+			const storage = stores.open(base);
+			await storage.saveMetadata('held' as BlockId, meta);
+			await storage.flush();
+
+			await assert.rejects(
+				() => storage.deleteBlock(blockId as BlockId),
+				/does not name a directory inside/,
+			);
+
+			// Nothing was removed and no log record was appended for the refused id: the store's own
+			// block still reads, and the store is still usable.
+			assert.deepStrictEqual(await storage.getMetadata('held' as BlockId), meta);
+			await storage.deleteBlock('held' as BlockId);
+			assert.strictEqual(await storage.getMetadata('held' as BlockId), undefined);
+		});
+	}
+});
+
 describe('FileKVStore over the write-ahead log', () => {
 	let base: string;
 	const stores = trackedStores();
