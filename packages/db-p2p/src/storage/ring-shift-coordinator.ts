@@ -4,7 +4,7 @@ import { routingKeyForBlock } from '@optimystic/db-core';
 import type { PartitionDetector } from '../cluster/partition-detector.js';
 import type { ArachnodeFretAdapter, ArachnodeInfo } from './arachnode-fret-adapter.js';
 import type { RingSelector } from './ring-selector.js';
-import { partitionCovers, qualifiesForFloor } from './arachnode-partition.js';
+import { narrowingSheds, qualifiesForFloor, type RingNarrowing } from './arachnode-partition.js';
 import { admittedBy, type NetworkMembershipGate } from '../network-membership-gate.js';
 import { createLogger } from '../logger.js';
 
@@ -47,6 +47,19 @@ export interface RingShiftDeps {
 	 * does not swallow a rejection, so a caller still sees a failed `executeShift`.
 	 */
 	onRelease: (blockIds: string[]) => void | Promise<void>;
+	/**
+	 * Called once Phase C of a **move-out** has advertised the narrower slice, with the slice this node
+	 * covered before and the one it covers now. Nothing else fires it: a move-in widens, and a shift
+	 * that rolled back never narrowed anything.
+	 *
+	 * This is the seam the blob side hangs off (`shedNarrowedBlobs` in
+	 * `packages/db-p2p/src/blob/ring-shed-pass.ts`): the coordinator stays a block-and-ring state
+	 * machine and knows nothing about blobs. Unlike {@link onRelease} it is NOT awaited and must not
+	 * block — the wiring hops its pass off this call — so a listener that throws synchronously is
+	 * logged and the shift still settles: the narrowing has already happened, and failing the shift
+	 * over the pass that follows it would report a settled handoff as failed.
+	 */
+	onNarrowed?: (narrowing: RingNarrowing) => void;
 	/**
 	 * The node's network-membership gate (`createNetworkMembershipGate`). A candidate holder the gate
 	 * refuses is neither pushed a shed block nor counted toward the floor — counting one would release
@@ -177,6 +190,10 @@ export class RingShiftCoordinator {
 
 		// Phase C — release: active at the new ring (moveFrom cleared), stop serving/spreading + GC-eligible.
 		this.deps.fretAdapter.setArachnodeInfo(this.clearMove({ ...target, status: 'active' }));
+		// Announced before the block ledger write below, not after: the narrowing is a fact the instant
+		// the advertisement flips, and the blob pass it starts must not be lost to a ledger fault that
+		// `onRelease` is deliberately allowed to surface.
+		this.announceNarrowed({ from: oldInfo?.partition, to: target.partition });
 		if (shed.length > 0) {
 			await this.deps.onRelease(shed);
 		}
@@ -213,14 +230,24 @@ export class RingShiftCoordinator {
 		oldPartition: ArachnodeInfo['partition'],
 		newPartition: ArachnodeInfo['partition']
 	): Promise<string[]> {
+		const narrowing: RingNarrowing = { from: oldPartition, to: newPartition };
 		const shed: string[] = [];
 		for (const blockId of this.deps.ownedBlocks) {
 			const coord = await hashKey(routingKeyForBlock(blockId));
-			if (partitionCovers(oldPartition, coord) && !partitionCovers(newPartition, coord)) {
+			if (narrowingSheds(narrowing, coord)) {
 				shed.push(blockId);
 			}
 		}
 		return shed;
+	}
+
+	/** {@link RingShiftDeps.onNarrowed}: never awaited, and a synchronous throw is logged, not raised. */
+	private announceNarrowed(narrowing: RingNarrowing): void {
+		try {
+			this.deps.onNarrowed?.(narrowing);
+		} catch (error) {
+			log('phaseC:narrowed-listener-threw err=%s', error instanceof Error ? error.message : String(error));
+		}
 	}
 
 	/**

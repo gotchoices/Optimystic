@@ -36,6 +36,7 @@ import { OwedBlobLedger } from './blob/owed-blob-ledger.js';
 import { BlobReferenceCheck } from './blob/reference-check.js';
 import { BlobAnnounceReceiver, type BlobHoldPolicy } from './blob/announce-receiver.js';
 import { BlobCohortReaction } from './blob/cohort-reaction.js';
+import { shedNarrowedBlobs } from './blob/ring-shed-pass.js';
 import { resolveReclaimGraceMs } from './blob/reclaim-marks.js';
 import { BlobReclaimPass } from './blob/reclaim-pass.js';
 import { seedHeldBlobs } from './blob/held-blob-seed.js';
@@ -88,6 +89,7 @@ import { ReleasedBlockLedger, type ReleaseSource } from './storage/released-bloc
 import { ReleasedBlockSweep } from './storage/released-block-sweep.js';
 import { DEFAULT_MIN_RING_CAPACITY_BYTES, MAX_RING_DEPTH, RingSelector } from './storage/ring-selector.js';
 import { RingShiftCoordinator } from './storage/ring-shift-coordinator.js';
+import type { RingNarrowing } from './storage/arachnode-partition.js';
 import { cacheBudgetBytes, StorageAccount } from './storage/storage-account.js';
 import { resolveStoragePressureThresholds, StoragePressure, type OwnWriteRoom } from './storage/storage-pressure.js';
 import type { StorageAllotmentOptions, StorageCapacity } from './storage/storage-account.js';
@@ -1120,6 +1122,14 @@ interface LateServingBindings {
 	 * pressure sample at `shedding`, or the next start-up.
 	 */
 	requestReleasedBlockSweep?: () => void;
+	/**
+	 * The blob arm of a ring narrowing, bound once the blob rebalance monitor exists. Late-bound
+	 * because Phase C of the ring shift is wired deep inside the Arachnode gate, while the monitor, the
+	 * reaction and the blob service its pass needs are built after the node has started. Until it is
+	 * bound — and on a node that runs no blob monitor — a narrowing sheds blocks only, and the blobs
+	 * outside the new slice stay held until a later narrowing or a cohort change offers them again.
+	 */
+	ringNarrowed?: (narrowing: RingNarrowing) => void;
 }
 
 /**
@@ -2127,6 +2137,10 @@ export async function createLibp2pNodeBase(
 		// costs no read. Its stop wrapper goes on at once, ahead of the fetcher's (installed earlier, so
 		// it runs after this one): a pull that ends after the receiver stops sends no `held`.
 		blobPeerAdmitted = peer => admittedBy(membership, peer);
+		// The slice this node serves, read live so a shift in flight is seen rather than a snapshot
+		// taken at construction. A client, and a node with Arachnode disabled or FRET absent, has no
+		// advertisement and so serves the whole keyspace — exactly today's behaviour.
+		const arachnodeAdapter = served?.arachnode?.fretAdapter;
 		blobReceiver = new BlobAnnounceReceiver({
 			selfId: node.peerId.toString(),
 			hold: blobHold,
@@ -2140,6 +2154,9 @@ export async function createLibp2pNodeBase(
 			// The second of the three doors a full node closes (`packages/db-p2p/docs/storage.md` §10): a
 			// node at `refusing` answers `out-of-space` rather than taking a new `responsible` hold.
 			storagePressure,
+			// The narrowed-slice door: what `shedNarrowedBlobs` hands over must not be announced straight
+			// back (`packages/db-p2p/src/blob/ring-shed-pass.ts`).
+			...(arachnodeAdapter ? { myArachnode: () => arachnodeAdapter.getMyArachnodeInfo() } : {}),
 			// Both ends abort a blob stream that moves no bytes for one response timeout, and nothing moves
 			// while the receiver reads committed state; the other half of the timeout is for the answer frame.
 			answerWithinMs: linkDeadlines.responseTimeoutMs / 2,
@@ -2234,7 +2251,8 @@ export async function createLibp2pNodeBase(
 		// or with arachnode disabled this stays inert exactly as the block reaction does, and a wiring
 		// failure is logged and non-fatal for the same reason: following a cohort is a resilience
 		// mechanism, and the drain still keeps a writer's copies moving without it.
-		if (served?.arachnode && (options.rebalance?.enabled ?? true) !== false) {
+		// `serving` is implied by `served` and tested only so the late binding below type-checks.
+		if (serving && served?.arachnode && (options.rebalance?.enabled ?? true) !== false) {
 			// Hoisted out of the `try` so the catch below can drop it: a failure after the feed is
 			// subscribed but before the stop wrapper is installed would otherwise leave a listener adding
 			// to a monitor nothing ever reads or tears down.
@@ -2324,12 +2342,33 @@ export async function createLibp2pNodeBase(
 				});
 				await monitor.start();
 				blobRebalanceMonitor = monitor;
+				// The blob arm of a ring narrowing (docs/arachnode-ring-handoff.md § Phase C): the ring
+				// decides what this node KEEPS, so a move-out hands its outside-the-new-slice blobs over as
+				// well as its blocks. Hopped off the Phase-C callback rather than awaited inside it, as the
+				// reaction above is hopped off the monitor's emit loop — the shift has already settled, and
+				// a blob whose release does not confirm is simply retained. Overlapping this pass with a
+				// monitor check is accepted for the reasons that NOTE gives: `releaseResponsible` is
+				// idempotent and duplicate announcements are what `AnnounceLimiter` is for.
+				serving.late.ringNarrowed = (narrowing) => {
+					void shedNarrowedBlobs({
+						selfId: node.peerId.toString(),
+						heldRefs: heldBlobRefs,
+						reaction,
+						keyNetwork,
+						floor: () => monitor.getCohortSize(),
+						releaseResponsible: ref => blobs.releaseResponsible(ref),
+						retainLost: ref => monitor.retainLost(ref),
+					}, narrowing).catch((err) => { blobCopyLog('shed:failed err=%o', err); });
+				};
 				let seedStopping = false;
 				{
 					const previousStop = node.stop.bind(node);
 					node.stop = async () => {
 						seedStopping = true;
 						offHoldsFeed?.();
+						// Unbound with the feed: a narrowing that lands while the node is stopping would
+						// otherwise start a pass that writes records through a stopping blob service.
+						serving.late.ringNarrowed = undefined;
 						try {
 							await monitor.stop();
 						} finally {
@@ -2344,6 +2383,7 @@ export async function createLibp2pNodeBase(
 					.catch((err) => { wiringLog('held-blob-seed seed failed: %o', err); });
 			} catch (err) {
 				offHoldsFeed?.();
+				serving.late.ringNarrowed = undefined;
 				wiringLog('blob rebalance wiring init failed: %o', err);
 			}
 		}
@@ -3646,7 +3686,11 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 								rebalanceMonitor.untrackBlock(blockId);
 							}
 							await recordReleased(blockIds, 'ring-shift');
-						}
+						},
+						// Phase C's blob effect, through the late binding the blob monitor's own wiring fills
+						// in (it is built after this role, beside the blob service it reacts with). Absent on a
+						// node that runs no blob monitor, and then a narrowing sheds blocks only.
+						onNarrowed: (narrowing) => serving.late.ringNarrowed?.(narrowing)
 					});
 					// Reconcile any stale `moving` advertisement left by a crash mid-handoff (no-op unless
 					// arachnode metadata survived a restart still marked `moving`).

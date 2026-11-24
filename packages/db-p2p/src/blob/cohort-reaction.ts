@@ -100,6 +100,9 @@ interface ReleasePlan {
  *
  * `event.gained` is not acted on, as for blocks: a tracked reference is one this node already holds.
  *
+ * {@link releaseLost} is a second, narrower entry point: the release arm on its own, over references
+ * named by something other than a cohort change — today, a ring narrowing (see its own comment).
+ *
  * The two arms run concurrently, each handling at most {@link REACTION_CONCURRENCY} references at a
  * time, and within one reference the announcements go in turn. Cohorts overlap, so that still leaves
  * up to {@link REACTION_CONCURRENCY} announcements in flight to one peer rather than one — the point
@@ -128,28 +131,35 @@ export class BlobCohortReaction {
 			return { released: [], retained: [...event.lost] as BlobRef[], growth };
 		}
 
-		const acceptance = await this.acceptanceOf(event);
-		const satisfiable = (peerId: string): boolean => this.satisfiedWithoutRequest(peerId, acceptance);
+		const acceptance = await this.acceptanceOfPeers(this.namedPeers(event.grown, event.newOwners));
 		const [release, growth] = await Promise.all([
-			this.releaseLost(event, satisfiable),
-			this.announceGrown(event.grown, satisfiable),
+			// Every id the blob monitor tracks came from a blob record, so it is a canonical reference.
+			this.releaseLost(event.lost as BlobRef[], event.newOwners, event.floor, acceptance),
+			this.announceGrown(event.grown, peerId => this.satisfiedWithoutRequest(peerId, acceptance)),
 		]);
 		return { released: release.released, retained: release.retained, growth };
 	}
 
-	/**
-	 * Every peer this event names, classified in ONE call — not one call per reference, which would be
-	 * one peer-store sweep per reference per check. A rejection is read as `unknown` for every peer,
-	 * which counts as accepting: a member not known to refuse blobs is owed one until it is, which errs
-	 * toward keeping this node's copy.
-	 */
-	private async acceptanceOf(event: RebalanceEvent): Promise<Record<string, BlobAcceptance>> {
+	/** Every peer the given reference→peers maps name, self excluded: the set one classification covers. */
+	private namedPeers(...named: ReadonlyArray<ReadonlyMap<string, readonly string[]>>): Set<string> {
 		const peers = new Set<string>();
-		for (const named of [...event.grown.values(), ...event.newOwners.values()]) {
-			for (const peerId of named) {
-				if (peerId !== this.deps.selfId) peers.add(peerId);
+		for (const map of named) {
+			for (const listed of map.values()) {
+				for (const peerId of listed) {
+					if (peerId !== this.deps.selfId) peers.add(peerId);
+				}
 			}
 		}
+		return peers;
+	}
+
+	/**
+	 * Which of these peers accept blobs, classified in ONE call — not one call per reference, which
+	 * would be one peer-store sweep per reference per check. A rejection is read as `unknown` for every
+	 * peer, which counts as accepting: a member not known to refuse blobs is owed one until it is, which
+	 * errs toward keeping this node's copy.
+	 */
+	private async acceptanceOfPeers(peers: ReadonlySet<string>): Promise<Record<string, BlobAcceptance>> {
 		if (peers.size === 0) return {};
 		try {
 			return await this.deps.acceptance([...peers]);
@@ -257,17 +267,43 @@ export class BlobCohortReaction {
 		return (await this.deps.records.responsibleScope(ref)) ?? (await this.deps.owed.get(ref))?.scope;
 	}
 
-	// ── `lost` — this node left a blob's cohort ──────────────────────
+	// ── `lost` — this node should stop keeping a blob for the network ─
 
-	private async releaseLost(
-		event: RebalanceEvent,
-		satisfiable: (peerId: string) => boolean
+	/**
+	 * The release arm, over any set of references this node should stop keeping: each one's
+	 * `responsible` hold may go only once at least `floor` of the blob's current `owners` answer a
+	 * `stat` with `whole`. Answers which holds may go and which must stay; the caller applies them
+	 * (`LocalBlobService.releaseResponsible` for the first, `RebalanceMonitor.retainLost` for the
+	 * second).
+	 *
+	 * Two paths reach this decision — the cohort change {@link handleRebalanceEvent} reacts to, and a
+	 * ring narrowing that leaves a blob outside the slice this node serves (`shedNarrowedBlobs` in
+	 * `packages/db-p2p/src/blob/ring-shed-pass.ts`) — so it is public rather than written twice. A
+	 * second implementation of the rule that decides whether a copy may go is the last thing this
+	 * should grow.
+	 *
+	 * `acceptance` lets a caller that has already classified `owners`' peers hand its map in rather
+	 * than have them classified a second time; omitted, they are classified here.
+	 */
+	async releaseLost(
+		refs: readonly BlobRef[],
+		owners: ReadonlyMap<string, readonly string[]>,
+		floor: number,
+		acceptance?: Record<string, BlobAcceptance>
 	): Promise<{ released: BlobRef[]; retained: BlobRef[] }> {
+		if (this.deps.partitionDetector.detectPartition()) {
+			// A count over the members this node can still see would drop a hold on the strength of a split
+			// view. `handleRebalanceEvent` checks this too, since it has growth outcomes to report as well;
+			// this is the check every OTHER caller of the release arm gets without making it.
+			log('release:partition refs=%d', refs.length);
+			return { released: [], retained: [...refs] };
+		}
+		const classified = acceptance ?? await this.acceptanceOfPeers(this.namedPeers(owners));
+		const satisfiable = (peerId: string): boolean => this.satisfiedWithoutRequest(peerId, classified);
 		const released: BlobRef[] = [];
 		const retained: BlobRef[] = [];
 		const plans: ReleasePlan[] = [];
-		// Every id the blob monitor tracks came from a blob record, so it is a canonical reference.
-		await inParallel(event.lost as BlobRef[], REACTION_CONCURRENCY, async (ref) => {
+		await inParallel(refs, REACTION_CONCURRENCY, async (ref) => {
 			const scope = await this.deps.records.responsibleScope(ref);
 			if (scope === undefined) {
 				// Neither released nor retained and no outcome, so the monitor's state for this reference is
@@ -276,11 +312,11 @@ export class BlobCohortReaction {
 				log('release:not-responsible ref=%s', ref);
 				return;
 			}
-			const candidates = [...new Set(event.newOwners.get(ref) ?? [])].filter(peerId => !satisfiable(peerId));
+			const candidates = [...new Set(owners.get(ref) ?? [])].filter(peerId => !satisfiable(peerId));
 			// The floor the block release uses, capped by the candidates that can actually hold the blob:
 			// an on-demand or older member never will, and requiring it would keep the hold for ever even
 			// when every member that can hold the blob does.
-			const required = Math.min(Math.max(1, event.floor), candidates.length);
+			const required = Math.min(Math.max(1, floor), candidates.length);
 			if (required === 0) {
 				// No new owner accepts blobs: nobody else would keep it.
 				log('release:no-accepting-owner ref=%s', ref);

@@ -237,10 +237,34 @@ Only now: set `status='active'` at the new ring, stop serving and stop spreading
 B confirmed ≥ N *other* serving holders, the serving replica count for every shed key never dips below
 N — the invariant holds across the release instant.
 
+**The blob arm.** Blobs are where the bytes are, so a narrowing that reached only blocks would free
+almost nothing on a node whose disk is mostly blobs. Release therefore also hands over the blobs
+whose routing key the old slice covered and the new one does not: each is announced to the blob's
+current cohort members, `stat`ed, and its `responsible` hold dropped only once the floor of them
+answers `whole` — the release rule
+[blobs.md § Placement, copying and durability](blobs.md#placement-copying-and-durability) already
+states, reached through the same code. `shedNarrowedBlobs` in
+`packages/db-p2p/src/blob/ring-shed-pass.ts` is the pass; the coordinator itself learns nothing about
+blobs, it only reports the narrowing (`onNarrowed`). Two details that are easy to get wrong and are
+therefore fixed here: the pass fires **only** from this phase, so a shift that rolled back sheds no
+blobs; and it takes both partitions from that report rather than re-reading the node's advertisement,
+which a later shift may have moved by the time the pass runs.
+
+**Blobs do not gate the shift.** Phase B keeps its all-or-nothing rule for blocks. The blob arm runs
+*after* release, per reference, and nothing it reports can roll a shift back: what confirms is
+released, what does not is retained and the node keeps serving it. Coupling the two would let one
+unconfirmable blob undo a block handoff that had already confirmed — a real guarantee traded for a
+storage saving.
+
+One consequence is worth stating because it is not a bug: a narrowed node also stops *accepting*
+announcements for blobs outside its slice (`BlobAnnounceReceiver`), so a blob every member of its
+cohort has narrowed past is declined by all of them. Its writer keeps its own copy and keeps
+retrying — the blob-level form of "the network has no room for this where it routes".
+
 **Move-in needs no release phase.** A node moving in only *gains* keyspace and sheds nothing, so the
 floor is never at risk from the mover. It still uses Phase A (advertise) so peers observe the
-membership change; the gained half is not fetched by this handoff, and it is not guaranteed to be
-pushed either. The cohort-growth push ([internals.md § RebalanceMonitor](internals.md#rebalancemonitor))
+membership change; the gained half is not fetched by this handoff — no blocks, and no blobs either,
+for the same reason — and it is not guaranteed to be pushed either. The cohort-growth push ([internals.md § RebalanceMonitor](internals.md#rebalancemonitor))
 derives a block's cohort from `findCluster` — FRET proximity plus network membership, with the
 arachnode ring depth playing no part — so it delivers the gained half only where FRET routing also
 places the mover in that block's cohort. What always delivers it is read repair on first access; the
@@ -356,10 +380,16 @@ coordinator rather than inline in `libp2p-node-base.ts`:
   the `moveOut` / `moveIn` thresholds of §1.5 come from (`packages/db-p2p/docs/storage.md` §10).
 - `packages/db-p2p/src/storage/ring-shift-coordinator.ts` — the Part 2/3 state machine:
   `executeShift` (advertise→confirm→release for move-out; advertise-only for move-in), rollback on
-  any Phase-B failure, and `reconcileOnStart` for crash mid-handoff.
+  any Phase-B failure, `reconcileOnStart` for crash mid-handoff, and `onNarrowed`, the one thing
+  Phase C reports to anything outside the block side.
 - `packages/db-p2p/src/storage/arachnode-partition.ts` — the shared prefix/coverage predicates:
   `partitionCovers`, `isServingHolder` (fail-toward-old-holder), `qualifiesForFloor` (excludes
-  same-range movers). Single source of truth for block/peer responsibility derivation.
+  same-range movers) and `narrowingSheds` (the half a move-out gives up, read by both the block and
+  the blob arm). Single source of truth for block/peer responsibility derivation.
+- `packages/db-p2p/src/blob/ring-shed-pass.ts` — the blob arm of Phase C: `selectShedBlobRefs` picks
+  the held references the narrowing gives up, `shedNarrowedBlobs` hands each to the release arm of
+  `BlobCohortReaction.releaseLost` and applies its answer. It never acquires, it decides nothing
+  about what a node takes, and it cannot roll a shift back.
 - `packages/db-p2p/src/cluster/block-transfer.ts` — `confirmReplicated(blockIds, owners, floor)` is
   the confirm primitive (pushes, counts holders reporting *not* `missing`, requires ≥ floor);
   `handleRebalanceEvent` returns `{ released, retained, replicated, underReplicated, growth }` — release is gated on confirmation, and the last three report the cohort-growth push arm (nothing is ever released off it). `growth` carries a per-block `GrowthOutcome { satisfiedPeers, complete }` that the caller feeds back to `RebalanceMonitor.recordGrowthOutcome`, so a grown peer is recorded as holding the block only once a push to it is confirmed; a block the reaction had no information about has no entry and is re-detected next check.

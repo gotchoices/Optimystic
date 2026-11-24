@@ -10,7 +10,10 @@
 
 import { peerIdFromString } from '@libp2p/peer-id';
 import { routingKeyForBlob, type BlobRef, type BlobScope, type BlobStat, type IKeyNetwork } from '@optimystic/db-core';
+import { hashKey } from 'p2p-fret';
 import { createLogger } from '../logger.js';
+import { isServingHolder } from '../storage/arachnode-partition.js';
+import type { ArachnodeInfo } from '../storage/arachnode-fret-adapter.js';
 import { admittedBy, type NetworkMembershipGate } from '../network-membership-gate.js';
 import { armUnrefTimer } from '../unref-timer.js';
 import { READ_ABANDONED, type AnnounceLimiter } from './announce-limiter.js';
@@ -46,6 +49,20 @@ export interface BlobAnnounceReceiverDeps {
 	 * that cannot measure itself does.
 	 */
 	storagePressure?: Pick<StoragePressure, 'refusingNewData'>;
+	/**
+	 * This node's own Arachnode advertisement, read fresh per decision
+	 * (`ArachnodeFretAdapter.getMyArachnodeInfo`). The slice it names BOUNDS which blobs this node
+	 * takes a `responsible` hold on: a blob outside it is answered `'not-responsible'`, and a blob a
+	 * read brought here is not kept. Without that, a node that narrowed its ring and handed its
+	 * outside-the-slice blobs over would be announced them again by the members that took them and
+	 * pull every one straight back (`shedNarrowedBlobs` in
+	 * `packages/db-p2p/src/blob/ring-shed-pass.ts` is the other half of this).
+	 *
+	 * Read through `isServingHolder`, so a node mid-shift still accepts for the range it is still
+	 * serving and refuses nothing it has not yet handed over. Absent — no Arachnode, no FRET — or
+	 * answering `undefined` means the whole keyspace, which is what ring 0 is.
+	 */
+	myArachnode?: () => ArachnodeInfo | undefined;
 	/** How long `decide` may spend reading committed state before it answers `unreferenced`: half the node's `responseTimeoutMs`. */
 	answerWithinMs: number;
 	/** Default Date.now. */
@@ -96,9 +113,10 @@ export class BlobAnnounceReceiver {
 	}
 
 	/**
-	 * Keeps a blob a read brought here under a `responsible` hold when this node is in its cohort,
-	 * has room, and committed state references it (docs/blobs.md §Placement, copying and durability,
-	 * "Readers repair"). Fire and forget: it returns at once and never throws.
+	 * Keeps a blob a read brought here under a `responsible` hold when this node is a responsible
+	 * holder for it (in its cohort, and inside the slice this node serves), has room, and committed
+	 * state references it (docs/blobs.md §Placement, copying and durability, "Readers repair"). Fire
+	 * and forget: it returns at once and never throws.
 	 */
 	keepAfterRead(ref: BlobRef): void {
 		if (this.deps.hold === 'on-demand' || this.repairing.has(ref)) {
@@ -146,7 +164,15 @@ export class BlobAnnounceReceiver {
 			log('announce:refused-peer peer=%s ref=%s', announcer, ref);
 			return 'unreferenced';
 		}
-		if (!await this.inCohort(ref)) {
+		// NOTE: a node that has narrowed past this blob but not yet handed it over answers
+		// `not-responsible` for one it still holds WHOLE and still serves, so the announcer stops
+		// counting it as a holder before it has actually released — which makes a writer's durability
+		// class conservative for as long as the handover takes, and permanently so where every member
+		// has narrowed past the key (docs/arachnode-ring-handoff.md § Phase C states that outcome). The
+		// safe direction: the writer keeps its own copy. If writers are ever seen holding owed copies
+		// for this reason, answer `whole` for a blob already held whole before testing the slice — not
+		// a new rule, just this check moved below the local `stat` it would then need.
+		if (!await this.responsibleFor(ref)) {
 			return 'not-responsible';
 		}
 		// After the cohort check on purpose: an honest peer whose cohort view differs from ours spends no allowance.
@@ -223,6 +249,30 @@ export class BlobAnnounceReceiver {
 		} finally {
 			cancelTimer?.();
 		}
+	}
+
+	/**
+	 * Whether this node is a responsible holder for `ref`: the slice it serves covers the blob's
+	 * routing key AND its own view of the blob's cohort includes it. Both halves are needed — the
+	 * cohort is what assigns a blob to a node, the slice is what bounds how much of its cohorts' work
+	 * a node keeps — and they are asked in that order because the slice is local arithmetic while the
+	 * cohort costs a peer-store sweep.
+	 */
+	private async responsibleFor(ref: BlobRef): Promise<boolean> {
+		return await this.servesSlice(ref) && await this.inCohort(ref);
+	}
+
+	/** Whether the slice this node serves covers `ref`; see {@link BlobAnnounceReceiverDeps.myArachnode}. */
+	private async servesSlice(ref: BlobRef): Promise<boolean> {
+		const info = this.deps.myArachnode?.();
+		if (info === undefined) {
+			return true;
+		}
+		const covers = isServingHolder(info, await hashKey(routingKeyForBlob(ref)));
+		if (!covers) {
+			log('announce:outside-slice ref=%s ring=%d', ref, info.ringDepth);
+		}
+		return covers;
 	}
 
 	/** Whether this node's own view of the blob's cohort includes it; a lookup that throws leaves responsibility undetermined, which the announcer asks about again. */
@@ -312,7 +362,10 @@ export class BlobAnnounceReceiver {
 	/** Reader repair, as `keepAfterRead` promises: never throws. */
 	private async repair(ref: BlobRef): Promise<void> {
 		try {
-			if (!await this.inCohort(ref)) {
+			// The same responsibility test the announcement path makes, slice included: a node that
+			// answers an announcement for this blob `not-responsible` must not re-adopt it because its
+			// own read brought it here — that is how a shed blob comes straight back.
+			if (!await this.responsibleFor(ref)) {
 				return;
 			}
 			if (await this.deps.local.responsibleScope(ref) !== undefined) {

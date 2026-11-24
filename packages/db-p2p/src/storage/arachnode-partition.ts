@@ -72,3 +72,26 @@ export function isServingHolder(info: ArachnodeInfo, coord: Uint8Array): boolean
 export function qualifiesForFloor(info: ArachnodeInfo, coord: Uint8Array): boolean {
 	return partitionCovers(info.partition, coord);
 }
+
+/**
+ * A narrowing of the slice a node serves: the partition it covered before a move-out and the one it
+ * covers after. Both ends may be absent — a node at ring 0 covers the whole keyspace, which is what
+ * an absent partition means to {@link partitionCovers}.
+ */
+export interface RingNarrowing {
+	from: RingPartition | undefined;
+	to: RingPartition | undefined;
+}
+
+/**
+ * Does `narrowing` shed the key at `coord`? — the old slice covered it and the new one does not.
+ *
+ * The one predicate both halves of a move-out's shed selection read: blocks, through
+ * `RingShiftCoordinator`'s Phase B enumeration, and blobs, through `selectShedBlobRefs` in
+ * `packages/db-p2p/src/blob/ring-shed-pass.ts`. Shared rather than written twice because the two
+ * halves must agree on which half of a narrowed slice the node is handing over — a blob side that
+ * inverted the test would release the half the node keeps.
+ */
+export function narrowingSheds(narrowing: RingNarrowing, coord: Uint8Array): boolean {
+	return partitionCovers(narrowing.from, coord) && !partitionCovers(narrowing.to, coord);
+}
