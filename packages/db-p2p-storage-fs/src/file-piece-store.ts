@@ -179,7 +179,10 @@ export class FilePieceStore implements IPieceStore {
 	/** The sum of the sizes of the files `list` yields; temps are excluded. */
 	async bytesUsed(): Promise<number> {
 		// NOTE: one stat per piece; if this ever shows up slow on a store of millions of pieces, keep a
-		// running total instead. A node whose block store shares the base path never calls it.
+		// running total instead. A node whose block store shares the base path leaves it out of its
+		// `capacity()` — the block store's directory walk already covers these bytes — and calls it only
+		// from `StorageAccount.breakdown`, which needs the piece figure on its own to subtract it; that
+		// is an operator's report on no timer, and nothing on a hot path asks for it.
 		let total = 0;
 		for await (const id of this.list()) total += await this.sizeOf(id);
 		return total;

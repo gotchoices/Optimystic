@@ -724,8 +724,9 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobRespo
 		};
 		for await (const { record } of this.readableRecords()) {
 			const kind = strongestHold(record.holds);
-			// A stored record always holds something (`holdsProblem` refuses one that does not), so this
-			// skips only a record a future hold kind this build does not know would leave.
+			// Unreachable on a stored record — `holdsProblem` refuses one holding nothing, and `HOLD_RANK`
+			// ranks every kind the decoder accepts — but the hold list is decoded from storage, so this
+			// answers it rather than asserting.
 			if (kind === undefined) {
 				continue;
 			}
@@ -1149,15 +1150,25 @@ function cacheOnly(record: BlobRecord): boolean {
 }
 
 /**
- * Strongest reason first, for {@link LocalBlobService.bytesByHold}: a pin is the application's and is
- * never evicted, an `owed` blob is one no other machine holds yet, a `responsible` blob is this
- * node's job, and `cached` is the only hold anything gives up on its own.
+ * Strongest reason first (lowest rank), for {@link LocalBlobService.bytesByHold}: a pin is the
+ * application's and is never evicted, an `owed` blob is one no other machine holds yet, a
+ * `responsible` blob is this node's job, and `cached` is the only hold anything gives up on its own.
+ *
+ * A `Record` rather than an ordered list so that a hold kind added to {@link BlobHoldKind} is a
+ * compile error here instead of a blob silently attributed to nothing and left out of the report —
+ * the remedy the `NOTE:` beside `HOLD_KINDS` in `blob-record.ts` names for the same hazard.
  */
-const HOLD_PRECEDENCE: readonly BlobHoldKind[] = ['pin', 'owed', 'responsible', 'cached'];
+const HOLD_RANK: Readonly<Record<BlobHoldKind, number>> = { pin: 0, owed: 1, responsible: 2, cached: 3 };
 
-/** The one hold a blob is attributed to: the first of {@link HOLD_PRECEDENCE} its record carries. */
+/** The one hold a blob is attributed to: the lowest-ranked kind its record carries, or undefined for a record holding nothing. */
 function strongestHold(holds: readonly BlobHold[]): BlobHoldKind | undefined {
-	return HOLD_PRECEDENCE.find(kind => holds.some(hold => hold.kind === kind));
+	let strongest: BlobHoldKind | undefined;
+	for (const { kind } of holds) {
+		if (strongest === undefined || HOLD_RANK[kind] < HOLD_RANK[strongest]) {
+			strongest = kind;
+		}
+	}
+	return strongest;
 }
 
 /**

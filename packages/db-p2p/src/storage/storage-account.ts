@@ -249,7 +249,9 @@ export class StorageAccount {
 	/**
 	 * Everything {@link capacity} reports, plus what the bytes are: the piece store's own figure, the
 	 * blocks and the node's bookkeeping together, and what each blob hold accounts for. For an
-	 * operator's dashboard and for `logRingInfo` in reference-peer — nothing on a hot path calls it.
+	 * operator's dashboard and for `logRingInfo` in reference-peer; NOTHING calls it yet, so its
+	 * assembly is unproven against a real backend — the first caller should check the figures it
+	 * reports against the store it reports them about. Nothing on a hot path is to call it.
 	 *
 	 * **Cost.** Everything `capacity()` costs, memoized as it is, plus up to two passes that are NOT
 	 * memoized and run on no timer: the piece store's own figure when the memoized scan did not
@@ -260,6 +262,13 @@ export class StorageAccount {
 	 * — see `bytesByHold`. `blobBytesByHold` is left ABSENT, rather than reported as four zeros, when
 	 * this account was given no blob records: a node whose blob service is not built yet has not found
 	 * zero bytes of blobs, it has not looked.
+	 *
+	 * Two of the reads are caught and leave their figure unknown (the free space, and the piece figure
+	 * this takes itself); the block store's use read and the record pass are not, so this REJECTS when
+	 * either of those fails rather than answering a partial report. That is the shape `capacity()`
+	 * already has, and `absent` is spoken for — it means "not looked", not "looked and failed". A
+	 * caller that would rather show an operator the figures it does have should catch here and say
+	 * which half is missing, not widen these fields.
 	 *
 	 * The figures are as close to one moment as they are cheap to make: the capacity comes from one
 	 * memoized scan, while a piece figure that scan did not take is read now and so may be newer than

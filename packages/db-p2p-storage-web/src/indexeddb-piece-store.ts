@@ -102,12 +102,16 @@ export class IndexedDBPieceStore implements IPieceStore {
 		}
 	}
 
-	// NOTE: reads every stored byte. It runs only off the documented configuration: when this store
-	// shares the block store's handle, `blockStoreCountsPieces` sees one identity and never calls it,
-	// since the block store's figure (`navigator.storage.estimate()`) already covers the origin. Over
-	// another handle or database the figure is counted twice, the origin estimate including it, which
-	// errs toward "fuller" as the `NOTE:` on `blockStoreCountsPieces` accepts. If this ever shows in
-	// a profile, keep each piece's size under a second key range and sum that instead.
+	// NOTE: reads every stored byte. When this store shares the block store's handle,
+	// `blockStoreCountsPieces` sees one identity and leaves it out of `capacity()`, since the block
+	// store's figure (`navigator.storage.estimate()`) already covers the origin; the one caller left in
+	// that configuration is `StorageAccount.breakdown`, which needs the piece figure on its own to
+	// subtract it, and on this backend that report therefore reads every piece the browser holds. It is
+	// an operator's report on no timer and nothing on a hot path asks for it, but it is the one place
+	// this cost is paid on the documented layout — so if a web node's breakdown is ever wanted
+	// routinely, keep each piece's size under a second key range and sum that instead. Over another
+	// handle or database the figure is counted twice, the origin estimate including it, which errs
+	// toward "fuller" as the `NOTE:` on `blockStoreCountsPieces` accepts.
 	async bytesUsed(): Promise<number> {
 		try {
 			const tx = this.db.transaction('pieces', 'readonly');

@@ -139,6 +139,7 @@ import { HlcClock, routingKeyForBlob, routingKeyForBlock } from '@optimystic/db-
 import { PartitionDetector } from './cluster/partition-detector.js';
 import { assertSuperMajorityCoupling } from './cluster/supermajority-coupling.js';
 import { createLogger } from './logger.js';
+import type { Logger } from './logger.js';
 import { PeerReputationService } from './reputation/peer-reputation.js';
 import type { IPeerReputation } from './reputation/types.js';
 import type { AuthorizeInboundStream, InboundStreamAuthorizationInit } from './inbound-authorization.js';
@@ -1000,6 +1001,27 @@ function resolveBlobCacheBudgetBytes(declared: number | undefined): number {
 		throw new RangeError(`blobs.cacheBudgetBytes must be an integer number of bytes at or above 0, got ${declared}`);
 	}
 	return declared;
+}
+
+/**
+ * What the read cache may take for ONE enforcement: {@link cacheBudgetBytes} over the account's own
+ * figures, falling back to the declared cap when the measurement cannot be read at all.
+ *
+ * The fallback is what keeps a storage fault from REMOVING the cache's bound instead of tightening
+ * it. A block-store scan that rejects rejects `capacity()`, which would reject the enforcement —
+ * `BlobCacheBudget.request` logs that and moves on — so nothing would evict for as long as the fault
+ * lasted and the cache would grow without a bound, which is worse than any figure. A node that
+ * cannot measure its storage is exactly the case `cacheBudgetBytes` answers with the declared cap, so
+ * a read that failed is given the same answer as a backend that reports nothing. Ring selection keeps
+ * the rejection instead: it must not act on a figure nobody measured.
+ */
+async function enforcementBudgetBytes(account: StorageAccount, declaredBytes: number, cachedBytes: number, log: Logger): Promise<number> {
+	try {
+		return cacheBudgetBytes({ declaredBytes, capacity: await account.capacity(), cachedBytes });
+	} catch (error) {
+		log('cache:budget-unmeasured declared=%d - %e', declaredBytes, error);
+		return declaredBytes;
+	}
 }
 
 /**
@@ -1896,17 +1918,14 @@ export async function createLibp2pNodeBase(
 		// §Lifetime). Built before `node.blobs`, which triggers it after every read or fetch that pulled
 		// something; its stop wrapper goes on AFTER the blob service's (installed above), so it runs
 		// BEFORE it and no enforcement writes a record or sweeps once the blob service has stopped.
+		const blobCacheLog = createLogger('blob:reclaim', node.peerId.toString());
 		const blobCacheBudget = new BlobCacheBudget({
 			records: blobs,
 			// Asked once per enforcement rather than fixed here, so an allotment the operator lowered — or
 			// other use that grew — is seen without a restart. `capacity()` is memoized, so this costs a
 			// scan at most once per its TTL however often reads trigger an enforcement.
-			budgetBytes: async cachedBytes => cacheBudgetBytes({
-				declaredBytes: blobCacheBudgetBytes,
-				capacity: await storageAccount.capacity(),
-				cachedBytes,
-			}),
-			log: createLogger('blob:reclaim', node.peerId.toString()),
+			budgetBytes: cachedBytes => enforcementBudgetBytes(storageAccount, blobCacheBudgetBytes, cachedBytes, blobCacheLog),
+			log: blobCacheLog,
 		});
 		{
 			const previousStop = node.stop.bind(node);

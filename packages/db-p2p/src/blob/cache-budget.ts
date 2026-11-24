@@ -45,6 +45,10 @@ export interface BlobCacheBudgetDeps {
 	 * Given the enforcement's own {@link sizedCacheBytes}, because the rule subtracts the cache's own
 	 * bytes from the node's use to see what is left for it, and this pass already has that figure: the
 	 * term costs no extra scan, and the budget and the eviction decision see one moment's cache.
+	 *
+	 * It must ANSWER rather than reject even when the measurement behind it cannot be read: a rejection
+	 * rejects the whole enforcement, and an enforcement that does not run is a cache with no bound at
+	 * all. `enforcementBudgetBytes` in `libp2p-node-base.ts` falls back to the declared cap.
 	 */
 	readonly budgetBytes: (cachedBytes: number) => Promise<number>;
 	readonly log: Logger;
@@ -161,7 +165,7 @@ export class BlobCacheBudget {
 	 *
 	 * Single-flight with one queued follow-on rather than joining the run in flight: that run
 	 * enumerated the records before this call's read cached anything, so joining it would
-	 * under-enforce. Several calls during one run share the single follow-on. A failing
+	 * under-enforce. Several calls during one run share the single follow-on. A failing `budgetBytes`,
 	 * `releaseCached` or `sweep` rejects this; `request` is the call that logs rather than rejects.
 	 */
 	enforce(): Promise<CacheEnforcement> {
