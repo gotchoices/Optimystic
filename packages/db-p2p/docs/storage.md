@@ -94,7 +94,8 @@ time.
 token as a required parameter — `savePendingTransaction`,
 `deletePendingTransaction`, `promotePendingTransaction`, `saveRevision`,
 `setLatest`, `saveMaterializedBlock`, `pruneSupersededMaterialization`,
-`saveBlockProof`, `restoreRevision`, `saveReplica`, `saveDeletion`, `recover`.
+`saveBlockProof`, `restoreRevision`, `saveReplica`, `saveDeletion`, `deleteBlock`,
+`recover`.
 The token's constructor is private to `block-latch.ts` and only
 `acquireBlockWriteLatch` can mint one, so an unlatched write does not type-check
 rather than merely being documented as forbidden. `BlockStorage` also checks at
@@ -140,6 +141,20 @@ grow under read load.
 concurrent out-of-band writer advances it, then write the whole metadata blob
 back on top — a non-monotonic regression that silently discards the out-of-band
 write.
+
+#### Deleting a block
+
+`IBlockStorage.deleteBlock(latch)` is the one operation that takes bytes back off a node: it removes every record this node holds for one block. Nothing else removes anything of a block's — an invalidation writes a compensating *forward* revision rather than erasing the one it reverses, and the only other delete in the whole surface is of one pending record. Its caller is a sweep over blocks the node has released responsibility for; the ring handoff is what releases a range safely (`docs/arachnode-ring-handoff.md` § Part 2, Phase C) and collects the released ids.
+
+**It holds the block's write latch**, which is why it is on `IBlockStorage` and takes a token rather than being a plain storage call. A delete is the widest write there is: a pend or a commit interleaving with it would write records back under a block whose metadata has just gone, leaving content no listing reports and no read serves. `BlockStorage.deleteBlock` therefore `assertLatch`es exactly as every other writer does, and the sweep acquires the latch the ordinary way.
+
+**It is ordered and resumable, not atomic.** Across stores the operation is allowed to be interrupted, provided the **metadata record goes first and durably**: metadata is what makes a block present, so once it is gone `getMetadata` answers `undefined`, `listBlockIds` (which enumerates metadata keys only) stops reporting the block, and a restart's owned-block seeding does not re-adopt it — the block reads as one this node does not hold, which is the state the delete is driving toward. What a crash in the middle leaves is therefore content with no metadata: bytes nothing serves and nothing reports, which **running the same `deleteBlock` again removes**, so the operation is required to be idempotent (on a block with no metadata it still takes the content; on a block with nothing at all it resolves quietly). The reverse order is forbidden, not merely discouraged: metadata naming a `latest` whose revision record is gone reads as a block this node *holds* and then throws inside materialization, where a block that reads as absent is a state the whole system already handles. Three of the four shipping backends happen to do the whole thing in one atomic transaction or batch (SQLite, IndexedDB, LevelDB), which is strictly stronger; the filesystem backend is the one that really is two steps, and its `meta.json` unlink is a synced write-ahead-log commit before the block's directory is removed.
+
+**It leaves the commit proofs store alone.** Six of the seven stores are filed under a block and are emptied; the seventh is keyed by a consensus message's hash alone (*Shared KV Kernel*, under Core Components), one entry per message however many blocks that message covered, so an entry may still certify revisions of blocks this node keeps and the key shape admits no per-block delete. `deleteBlock` removes the deleted block's *entries* in the proofs store and leaves the proof *bodies* those entries referred to — orphaned when no revision of any kept block names them. Sweeping that residual is the backlog ticket `debt-unreferenced-commit-proofs-are-never-swept`.
+
+**It emits no change notification.** Every other write path emits a collection change so trackers and the reactivity layer see it. A delete emits nothing, deliberately: the block's *content* has not changed, this node has merely stopped holding it, and a change event would send readers to re-read a block this node is no longer the place to ask. A reader that still wants the block is served by the rest of the cohort, and a later local read repairs from it through `RestorationCoordinator`, exactly as for any block this node does not hold. For the same reason the delete does not touch the resilience monitors' owned-block set: a released block is untracked at Phase C, before it is ever eligible.
+
+**It is not a network delete.** Removing a block some peer still expects this node to serve loses data for the cohort. Which blocks may be given to it — and the durable ledger that makes a half-done delete resumable across a restart — belong to the sweep, not to this operation.
 
 ### 3. Committed revisions are append-only; `latest` never advances past a materializable revision
 
@@ -742,6 +757,9 @@ The `BlockStorage` class manages individual block operations, providing versioni
   because `commit` holds N block latches and must do no network I/O inside them.
 - `savePendingTransaction(actionId, transform, latch)`: Stores uncommitted transactions
 - `promotePendingTransaction(actionId, latch)`: Converts pending to committed transactions
+- `deleteBlock(latch)`: Removes everything this node holds for the block — the only operation that
+  takes bytes back off a node, for a block it has stopped being responsible for (Invariant 2,
+  *Deleting a block*)
 
 ### 3. Raw Storage Interface (`IRawStorage`)
 
@@ -752,6 +770,8 @@ The `IRawStorage` interface defines low-level storage operations, abstracting th
 - **Transaction Storage**: Both pending and committed transactions
 - **Block Materialization**: Storing and retrieving materialized blocks
 - **Revision Management**: Mapping revisions to transaction IDs
+- **Removal**: `deleteBlock(blockId)` takes a whole block off the store; nothing else removes
+  anything of a block's (Invariant 2, *Deleting a block*)
 - **Durability**: `flush()` makes every write resolved before it survive the crashes the store's fixed `durability` names (Invariant 6 above)
 
 **How much room is left.** Beside `getApproximateBytesUsed`, a block store may report `getApproximateBytesFree()` — the bytes its LOCATION will still accept, by the backend's cheapest honest measure. It is the location's figure and not this store's share of it, so every store over one location answers the same number, which is why anything accounting for a node's room asks the block store and nobody else. Two rules make it safe to read: a failed measurement **rejects** rather than answering 0 (0 means "full", and a transient failure read as full would make a node shed responsibility it did not need to shed — a consumer catches and treats the figure as unknown for that scan), and whether a store has the method at all is fixed at construction, so a backend that cannot ask its platform omits it entirely rather than installing a stub. Which backends have one:
@@ -799,7 +819,9 @@ Six of the stores are filed under a block. The seventh, **commit proofs**
 consensus message, keyed by the proof's `messageHash` alone, so a proof covering many blocks can be
 stored once rather than once per block in the proofs store. Each backend gives it a keyspace of its
 own: a map, a root `commit-proofs/` directory, a `commit_proofs` table, the LevelDB tag byte `0x08`
-with no block envelope, a `commitProofs` object store. Like the proofs store it has no delete. The
+with no block envelope, a `commitProofs` object store. It has no delete, and `deleteBlock` (Invariant
+2, *Deleting a block*) empties the other six and leaves this one alone: a key names a message, not a
+block. The
 file backend names a file after the hash, which `computeClusterMessageHash` in
 `packages/db-core/src/cluster/membership.ts` writes in base58 and so needs no encoding; it
 percent-encodes any other character, so no key names a path outside the store.
@@ -866,6 +888,14 @@ discipline the old in-memory backend needed is now structural, not a rule — se
 docs/internals.md "Storage Returns References". `promote` (pending → committed) is
 the only cross-key atomic operation the kernel requires; each backend satisfies it
 with its native atomic primitive (batch / DB transaction / one write-ahead-log record).
+
+`deleteBlock` is the one driver operation the kernel does not compose out of per-key calls, and the
+one `BatchBackend` write that is not a batch entry: the kernel cannot enumerate a block's revisions
+(`rangeRevisions` is a bounded scan, and the top revision is only knowable from the very metadata
+the operation removes), while every backend has a cheap native answer for "everything under this
+block" — a directory removal, six `DELETE … WHERE block_id = ?`, six tag ranges, six object-store
+key ranges. What it must and must not touch, and the ordering it owes, are under Invariant 2,
+*Deleting a block*.
 
 Every shipping backend uses this kernel today: in-memory (`MemoryStoreDriver`) supplies only a
 driver, the filesystem and NativeScript SQLite backends each supply a `BatchBackend`

@@ -279,6 +279,30 @@ export interface IBlockStorage {
     saveDeletion(source: ActionRev, latch: BlockWriteLatch): Promise<ActionRev>;
 
     /**
+     * Removes everything this node holds for the block — every record of the six block-scoped stores
+     * (metadata, revisions, pending transforms, committed transforms, materializations, proof
+     * entries). The one operation that takes bytes back off a node, for a block it has stopped being
+     * responsible for; the storage-level contract is `IRawStorage.deleteBlock`'s, including which
+     * stores it touches, that it is ordered rather than atomic, and that it is idempotent.
+     *
+     * **The latch is not optional**, and it is why this takes one rather than being a plain storage
+     * call: a delete is the widest write there is, and a pend or commit interleaving with it would
+     * write records back under a block whose metadata has just gone, leaving content no listing
+     * reports and no read serves.
+     *
+     * After it, the block reads as one this node has never seen: `getLatest()` and `getBlock()`
+     * answer `undefined`, `IRawStorage.listBlockIds` stops reporting it, and a restart does not
+     * re-adopt it. Nothing is notified — the block's content has not changed, this node has merely
+     * stopped holding it — and a reader that still wants it is served by the rest of the cohort, the
+     * same way any block this node does not hold is.
+     *
+     * **It is not a network delete.** Removing a block that some peer still expects this node to
+     * serve loses data for the cohort. The caller is responsible for the block already being one
+     * this node has released responsibility for and stopped serving.
+     */
+    deleteBlock(latch: BlockWriteLatch): Promise<void>;
+
+    /**
      * Reconciles `metadata.latest` with the highest contiguous fully-promoted revision in
      * the revisions table. Intended for post-crash recovery of the Crash-D3 gap, where
      * `promotePendingTransaction` succeeded but `setLatest` did not: the revision and

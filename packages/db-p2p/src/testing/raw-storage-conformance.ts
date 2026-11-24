@@ -455,6 +455,87 @@ export function runRawStorageConformance(
 			expect(error!.message).to.equal(`Pending action nope not found for block ${blockId}`);
 		});
 
+		// --- deleteBlock (the one operation that takes bytes back off a node) ---
+
+		it('deleteBlock removes every block-scoped store\'s records for its block and leaves another block\'s untouched', async () => {
+			const gone = 'del-gone' as BlockId;
+			const kept = 'del-kept' as BlockId;
+			const transform: Transform = { insert: makeBlock('del-tx', { items: ['x'] }) };
+			// ONE proof for both blocks, so its body in the commit proofs store is shared: deleting
+			// `gone` must take `gone`'s proofs-store ENTRIES and leave that body, which is what keeps
+			// `kept`'s proof readable. A backend whose key range is one off takes the body with it.
+			const proof = makeProof('shared');
+
+			for (const blockId of [gone, kept]) {
+				await storage.saveMetadata(blockId, { ranges: [[1, 3]], latest: { rev: 2, actionId: 'a2' as ActionId } });
+				for (const rev of [1, 2]) {
+					await storage.saveRevision(blockId, rev, `a${rev}` as ActionId);
+					await storage.saveBlockProof(blockId, rev, proof);
+				}
+				await storage.savePendingTransaction(blockId, 'pend-1' as ActionId, transform);
+				await storage.saveTransaction(blockId, 'a2' as ActionId, transform);
+				await storage.saveMaterializedBlock(blockId, 'a2' as ActionId, makeBlock(blockId));
+			}
+
+			await storage.deleteBlock(gone);
+
+			expect(await storage.getMetadata(gone), 'metadata').to.equal(undefined);
+			expect(await storage.getRevision(gone, 1), 'revision 1').to.equal(undefined);
+			expect(await storage.getRevision(gone, 2), 'revision 2').to.equal(undefined);
+			expect(await collect(storage.listRevisions(gone, 1, 3)), 'revision listing').to.deep.equal([]);
+			expect(await storage.getProofEntry(gone, 2), 'proofs-store entry').to.equal(undefined);
+			expect(await storage.getBlockProof(gone, 2), 'resolved proof').to.equal(undefined);
+			expect(await storage.getPendingTransaction(gone, 'pend-1' as ActionId), 'pending transform').to.equal(undefined);
+			expect(await collect(storage.listPendingTransactions(gone)), 'pending listing').to.deep.equal([]);
+			expect(await storage.getTransaction(gone, 'a2' as ActionId), 'committed transform').to.equal(undefined);
+			expect(await storage.getMaterializedBlock(gone, 'a2' as ActionId), 'materialized block').to.equal(undefined);
+
+			expect(await storage.getMetadata(kept), 'kept metadata').to.deep.equal({ ranges: [[1, 3]], latest: { rev: 2, actionId: 'a2' } });
+			expect(await storage.getRevision(kept, 1), 'kept revision 1').to.equal('a1');
+			expect(await storage.getRevision(kept, 2), 'kept revision 2').to.equal('a2');
+			expect(await storage.getBlockProof(kept, 2), 'kept proof still resolves through the shared body').to.deep.equal(proof);
+			expect(await storage.getPendingTransaction(kept, 'pend-1' as ActionId), 'kept pending transform').to.deep.equal(transform);
+			expect(await storage.getTransaction(kept, 'a2' as ActionId), 'kept committed transform').to.deep.equal(transform);
+			expect(await storage.getMaterializedBlock(kept, 'a2' as ActionId), 'kept materialized block').to.deep.equal(makeBlock(kept));
+
+			if (typeof storage.listBlockIds === 'function') {
+				expect(new Set(await collect(storage.listBlockIds())), 'listing after the delete').to.deep.equal(new Set([kept]));
+			}
+		});
+
+		it('deleteBlock is idempotent and finishes a half-done delete', async () => {
+			const twice = 'del-twice' as BlockId;
+			const halfDone = 'del-half' as BlockId;
+			const transform: Transform = { insert: makeBlock('del-half') };
+
+			// Called again on a block it already emptied: resolves, removes nothing, throws nothing.
+			await storage.saveMetadata(twice, { ranges: [[1]], latest: { rev: 1, actionId: 'a1' as ActionId } });
+			await storage.saveRevision(twice, 1, 'a1' as ActionId);
+			await storage.deleteBlock(twice);
+			await storage.deleteBlock(twice);
+			expect(await storage.getMetadata(twice), 'metadata after two deletes').to.equal(undefined);
+			expect(await storage.getRevision(twice, 1), 'revision after two deletes').to.equal(undefined);
+
+			// The state a crash between the two halves of a delete leaves: content with no metadata.
+			// Writing the content without metadata reproduces it at this layer, and re-running the
+			// delete must take it — which is what lets a sweep resume after a restart.
+			await storage.saveRevision(halfDone, 7, 'a7' as ActionId);
+			await storage.saveTransaction(halfDone, 'a7' as ActionId, transform);
+			await storage.savePendingTransaction(halfDone, 'pend-1' as ActionId, transform);
+			await storage.saveMaterializedBlock(halfDone, 'a7' as ActionId, makeBlock(halfDone));
+			expect(await storage.getMetadata(halfDone), 'no metadata was written').to.equal(undefined);
+
+			await storage.deleteBlock(halfDone);
+
+			expect(await storage.getRevision(halfDone, 7), 'revision of a metadata-less block').to.equal(undefined);
+			expect(await storage.getTransaction(halfDone, 'a7' as ActionId), 'committed transform of a metadata-less block').to.equal(undefined);
+			expect(await collect(storage.listPendingTransactions(halfDone)), 'pending listing of a metadata-less block').to.deep.equal([]);
+			expect(await storage.getMaterializedBlock(halfDone, 'a7' as ActionId), 'materialization of a metadata-less block').to.equal(undefined);
+
+			// A block this store has never held: quiet success, not a throw.
+			await storage.deleteBlock('del-never-seen' as BlockId);
+		});
+
 		// --- Clone-on-store / clone-on-read (now structural via the byte boundary) ---
 
 		it('saveMetadata snapshots — a later caller mutation does not corrupt stored state', async () => {

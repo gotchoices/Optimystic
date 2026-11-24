@@ -82,6 +82,18 @@ export class MemoryBatchBackend implements BatchBackend {
 	}
 
 	/**
+	 * Drop the block's rows at once (`BatchBackend.deleteBlock`). Not recorded in {@link committed}:
+	 * it is not a batch, and a test counting commits must not see one. A batch already committed
+	 * stays in {@link committed} with its entries, so {@link powerLoss} rebuilds the maps from it and
+	 * un-deletes the block — which is the crash the delete contract is explicit about not surviving:
+	 * the delete is the store's own write, and this double keeps no durable record of it.
+	 */
+	async deleteBlock(blockId: BlockId): Promise<void> {
+		this.throwIfFailed();
+		this.rows.deleteBlock(blockId);
+	}
+
+	/**
 	 * Apply the batch to the maps at once, so reads reflect it, and record it. Without `deferSync`,
 	 * or with `syncWithinMs` 0, this and every earlier batch are durable before this resolves.
 	 */

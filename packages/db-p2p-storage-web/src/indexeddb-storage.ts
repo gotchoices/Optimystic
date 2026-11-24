@@ -31,6 +31,23 @@ export const IDB_HANDLE_SCHEME = 'idb-handle';
 /** The object stores an apply writes: the seven block-storage stores and the journal itself. */
 const APPLY_STORES = ['metadata', 'revisions', 'pending', 'transactions', 'proofs', 'commitProofs', 'materialized', 'journal'] as const;
 
+/**
+ * The object stores `deleteBlock` empties, metadata first — the six block-scoped stores.
+ * `commitProofs` is absent and must stay absent: its keys name consensus messages, not blocks (see
+ * `BatchBackend.deleteBlock`). So are `journal`, `kv` and `pieces`, which share this database.
+ */
+const BLOCK_SCOPED_STORES = ['metadata', 'revisions', 'proofs', 'pending', 'transactions', 'materialized'] as const;
+
+/**
+ * Every key of one block in a store keyed `[blockId, …]` — the five compound-keyed block stores.
+ * IndexedDB compares array keys element-by-element, a shorter prefix-equal array sorts below a
+ * longer one, and an array sorts above every primitive type, so `[blockId]` ≤ every
+ * `[blockId, rev]` and `[blockId, actionId]` < `[blockId, []]` and no other block's key falls
+ * between: the bounds capture exactly this block's keys.
+ */
+const blockKeyRange = (blockId: BlockId): IDBKeyRange =>
+	IDBKeyRange.bound([blockId] as IDBValidKey, [blockId, []] as IDBValidKey);
+
 /** The IndexedDB key a `StoreKey` addresses in its object store: the keys the schema declares. */
 type IdbKey = string | [BlockId, number] | [BlockId, ActionId];
 
@@ -186,11 +203,7 @@ export class IndexedDBJournalStore implements JournalStore {
 	}
 
 	async listPendingActionIds(blockId: BlockId): Promise<ActionId[]> {
-		// IndexedDB key ordering: array keys compare element-by-element, and a
-		// shorter prefix-equal array is less than a longer one; arrays sort
-		// above all primitive types. So `[blockId]` < `[blockId, anyActionId]`
-		// < `[blockId, []]`, which captures exactly every key for this block.
-		const range = IDBKeyRange.bound([blockId] as IDBValidKey, [blockId, []] as IDBValidKey);
+		const range = blockKeyRange(blockId);
 		const tx = this.db.transaction('pending', 'readonly');
 		const store = tx.objectStore('pending');
 		// Snapshot-first, same rationale as rangeRevisions.
@@ -241,6 +254,43 @@ export class IndexedDBJournalStore implements JournalStore {
 			throw new Error('navigator.storage.estimate() reported no quota, so the free space of this origin is unknown');
 		}
 		return Math.max(0, estimate.quota - (estimate.usage ?? 0));
+	}
+
+	// --- delete a whole block ---
+
+	/**
+	 * `BatchBackend.deleteBlock`: ONE transaction over the six block-scoped object stores, strict
+	 * where the browser supports it, deleting the block's key from `metadata` and the block's whole
+	 * key range from each of the five compound-keyed stores. One transaction is atomic, so no crash
+	 * leaves the delete half-done — stronger than the contract's metadata-first ordering, which the
+	 * store order states anyway.
+	 *
+	 * `commitProofs`, `journal`, `kv` and `pieces` are not in the transaction at all, so they cannot
+	 * be reached: a commit proof's key names a consensus message, not a block, and may still certify
+	 * revisions of blocks this node keeps.
+	 *
+	 * Idempotent: deleting an absent key or an empty range is not an error. Every request is queued
+	 * synchronously and the transaction awaited once, because IndexedDB commits a transaction left
+	 * idle.
+	 *
+	 * The six stores are named twice — once as the transaction's scope, once per request — which
+	 * cannot drift: a store left out of the scope makes `tx.objectStore(...)` a compile error against
+	 * `idb`'s scope-typed handle, and a `NotFoundError` at run time.
+	 */
+	async deleteBlock(blockId: BlockId): Promise<void> {
+		const tx = this.db.transaction(BLOCK_SCOPED_STORES, 'readwrite', { durability: transactionDurability(this.strict) });
+		// `metadata` is keyed by the block id itself; the other five by `[blockId, …]`, so each takes
+		// the block's whole key range.
+		const range = blockKeyRange(blockId);
+		await Promise.all([
+			tx.objectStore('metadata').delete(blockId),
+			tx.objectStore('revisions').delete(range),
+			tx.objectStore('proofs').delete(range),
+			tx.objectStore('pending').delete(range),
+			tx.objectStore('transactions').delete(range),
+			tx.objectStore('materialized').delete(range),
+			tx.done,
+		]);
 	}
 
 	// --- the journal ---

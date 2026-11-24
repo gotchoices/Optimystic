@@ -24,8 +24,10 @@ export interface JournalContents {
 }
 
 /**
- * The engine under a {@link JournalBatchBackend}: the applied stores' reads, as `BatchBackend`'s,
- * and three journal writes in place of its `commit` and `sync`. The journal — the numbered records
+ * The engine under a {@link JournalBatchBackend}: the applied stores' reads and `deleteBlock`, as
+ * `BatchBackend`'s, and three journal writes in place of its `commit` and `sync`. `deleteBlock` is
+ * the engine's own write, never journaled — the backend applies everything held before calling it,
+ * so no record can be applied over the emptied block afterwards. The journal — the numbered records
  * and the applied-through mark — lives in a keyspace of the engine's own (an IndexedDB object
  * store, a LevelDB tag byte) that the seven block-storage stores never touch, and reads never reflect
  * a record until an apply has applied it. `durability` says what an apply survives before it
@@ -235,6 +237,31 @@ export class JournalBatchBackend<R extends StoredValue = Uint8Array> implements 
 	private async *openedBlockIds(): AsyncIterable<BlockId> {
 		await this.open();
 		yield* this.store.listBlockIds!();
+	}
+
+	// --- delete a whole block ---
+
+	/**
+	 * Apply everything held, then have the store remove the block (`BatchBackend.deleteBlock`).
+	 *
+	 * The apply is what keeps the delete the last write to the block: a journal record holding a put
+	 * for it would otherwise be applied after the delete — by the deadline timer, or by the next
+	 * open's recovery — and resurrect what was just removed. The driver above flushes strictly before
+	 * calling this, so normally nothing is held and the apply touches no disk; the step is here
+	 * because this is a `BatchBackend` method and its contract cannot rest on one caller's habits.
+	 *
+	 * Queued with the opens, commits and applies, so it cannot interleave with one of them. A
+	 * rejection does NOT latch the backend: a part-done delete is content with no metadata, which the
+	 * contract already allows and a later call finishes, and it breaks no ordering rule the way a lost
+	 * group would.
+	 */
+	deleteBlock(blockId: BlockId): Promise<void> {
+		return this.enqueue(async () => {
+			await this.open();
+			this.throwIfFailed();
+			await this.applyHeld();
+			await this.store.deleteBlock(blockId);
+		});
 	}
 
 	// --- the sink ---

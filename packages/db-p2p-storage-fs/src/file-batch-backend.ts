@@ -337,6 +337,58 @@ export class FileBatchBackend implements BatchBackend {
 		return this.log?.sync() ?? Promise.resolve();
 	}
 
+	// --- delete a whole block ---
+
+	/**
+	 * Unlink `meta.json` through the log, checkpoint, then remove the block's directory —
+	 * `BatchBackend.deleteBlock`, in the three steps the write-ahead rule leaves available.
+	 *
+	 * The metadata unlink is an ordinary synced commit, so it is durable and replay-safe before
+	 * anything else is touched: that is the contract's "metadata first". The checkpoint then makes the
+	 * tree as durable as the log and DISCARDS the log, which is what makes the recursive remove safe —
+	 * a tree file only ever holds content whose log record is durable, so an unlink the log does not
+	 * know about would be undone by the next open's replay. With the log gone there is nothing to
+	 * replay over the directory. A crash during the remove leaves the block's content with its
+	 * metadata already gone, which is exactly the state the contract drives toward and a later call
+	 * finishes.
+	 *
+	 * The directory holds only this block's six block-scoped stores (`{meta.json,revs/,pend/,actions/,
+	 * proofs/,blocks/}`), so the removal is scoped by construction: the commit proofs store, the
+	 * key-value namespaces, the piece directory and the log all live at the root, outside it.
+	 *
+	 * `force` is exactly the ENOENT tolerance idempotence needs — a block with nothing on disk removes
+	 * nothing and resolves — and leaves every other error (EACCES, EIO, ...) to surface, the
+	 * discrimination `directoryByteSize` and `listPendingActionIds` make by hand.
+	 *
+	 * A failing remove rejects and nothing more: the store stays usable and a later call retries. The
+	 * first two steps are the log's own operations and latch the log if they fail, as every append
+	 * and checkpoint does — that is the flush contract's rule 5 and not this operation's choice.
+	 */
+	// NOTE: one checkpoint per deleted block. Each seals the log the metadata unlink just appended to
+	// — a rename, the tree syncs for that one record, an unlink — not a whole store's worth of
+	// pending writes, unless live commits are interleaved with the sweep. Unmeasured, and deleting is
+	// never on a read or commit path; if a sweep of many blocks ever shows up as slow, delete a batch
+	// of blocks under one checkpoint instead of one each.
+	//
+	// NOTE: a block directory that nests another block's (`.../Ledger/` holds `.../Ledger/index/`)
+	// loses the nested block's records too. The same accepted limit of the raw-id layout the listing
+	// documents at `BLOCK_STORE_DIRS`: if such ids ever occur, encode block-id segments in the layout.
+	// Reachable only through a caller that deletes an outer block while keeping an inner one, which
+	// the responsibility ranges a sweep works from do not produce (a nested id shares its parent's
+	// key prefix, so both fall in the same released range).
+	//
+	// NOTE: the block's own directory goes, but an intermediate directory of a nested id
+	// (`default/app/` for `default/app/Ledger`) is left behind empty — the listing descends it and
+	// yields nothing, so it costs an inode and no correctness. If a store ever accumulates many empty
+	// prefix directories, prune upward to the first non-empty ancestor.
+	async deleteBlock(blockId: BlockId): Promise<void> {
+		await this.open();
+		const { durable } = await this.commit([{ key: { store: 'metadata', blockId } }], { syncWithinMs: 0 });
+		await durable;
+		await this.shared().checkpoint();
+		await fs.rm(this.blockPath(blockId), { recursive: true, force: true });
+	}
+
 	async close(): Promise<void> {
 		const shared = this.log;
 		this.log = undefined;

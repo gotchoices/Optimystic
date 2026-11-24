@@ -44,6 +44,10 @@ export class TextReadsJournalStore implements JournalStore<string> {
 		return this.store.listPendingActionIds(blockId);
 	}
 
+	deleteBlock(blockId: BlockId): Promise<void> {
+		return this.store.deleteBlock(blockId);
+	}
+
 	appendJournal(record: JournalRecord): Promise<void> {
 		return this.store.appendJournal(record);
 	}

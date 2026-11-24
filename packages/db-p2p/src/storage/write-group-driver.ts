@@ -197,6 +197,25 @@ export class WriteGroupDriver<V extends StoredValue = Uint8Array> implements Raw
 		this.group.delete(pending);
 	}
 
+	// --- delete a whole block ---
+
+	/**
+	 * Flush the group, then have the backend remove the block (`RawStoreDriver.deleteBlock`).
+	 *
+	 * The flush is not optional and it is not merely tidy: a put for the block waiting in the overlay
+	 * would otherwise reach the backend in a later commit — AFTER the delete — and resurrect what was
+	 * just removed. Flushing first makes the delete the last write to the block, which is what the
+	 * block's write latch guarantees it stays.
+	 *
+	 * The flush is wider than the one block, since a group has no per-block seal, and it is strict, so
+	 * it waits for the disk. Both are acceptable: a delete follows a node releasing responsibility for
+	 * a block and is never on a read or commit path.
+	 */
+	async deleteBlock(blockId: BlockId): Promise<void> {
+		await this.group.flush();
+		await this.backend.deleteBlock(blockId);
+	}
+
 	// --- flush / close ---
 
 	flush(options?: FlushOptions): Promise<void> {

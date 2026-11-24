@@ -176,6 +176,13 @@ export class RawStorageDriverAdapter implements RawStoreDriver {
 		await this.inner.promotePendingTransaction(blockId, actionId);
 	}
 
+	// --- delete a whole block ---
+
+	/** The inner storage's; the whole contract is the same at both surfaces (`RawStoreDriver.deleteBlock`). */
+	async deleteBlock(blockId: BlockId): Promise<void> {
+		await this.inner.deleteBlock(blockId);
+	}
+
 	// --- flush ---
 
 	flush(options?: FlushOptions): Promise<void> {

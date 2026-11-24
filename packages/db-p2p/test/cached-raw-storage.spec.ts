@@ -78,6 +78,7 @@ class GatedStoreDriver implements RawStoreDriver {
 	putMaterialized(blockId: BlockId, actionId: ActionId, value: Uint8Array) { return this.inner.putMaterialized(blockId, actionId, value); }
 	deleteMaterialized(blockId: BlockId, actionId: ActionId) { return this.inner.deleteMaterialized(blockId, actionId); }
 	promote(blockId: BlockId, actionId: ActionId) { return this.inner.promote(blockId, actionId); }
+	deleteBlock(blockId: BlockId) { return this.inner.deleteBlock(blockId); }
 	flush(options?: FlushOptions) { return this.inner.flush(options); }
 	whenDurable() { return this.inner.whenDurable(); }
 	get durability(): StoreDurability { return this.inner.durability; }
@@ -129,6 +130,7 @@ class FaultyStoreDriver implements RawStoreDriver {
 	putMaterialized(blockId: BlockId, actionId: ActionId, value: Uint8Array) { return this.inner.putMaterialized(blockId, actionId, value); }
 	deleteMaterialized(blockId: BlockId, actionId: ActionId) { return this.inner.deleteMaterialized(blockId, actionId); }
 	promote(blockId: BlockId, actionId: ActionId) { return this.inner.promote(blockId, actionId); }
+	deleteBlock(blockId: BlockId) { return this.inner.deleteBlock(blockId); }
 	flush(options?: FlushOptions) { return this.inner.flush(options); }
 	whenDurable() { return this.inner.whenDurable(); }
 	get durability(): StoreDurability { return this.inner.durability; }

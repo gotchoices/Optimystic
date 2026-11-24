@@ -62,6 +62,22 @@ const PUT_SQL = sqlByStore(store => {
 });
 const DELETE_SQL = sqlByStore(store => `DELETE FROM ${LAYOUTS[store].table} WHERE ${whereKey(store)}`);
 
+/**
+ * The six block-scoped stores, in the order `deleteBlock` empties them: metadata first, so a
+ * transaction that somehow failed part-way would leave content with no metadata (it cannot — the
+ * delete is one transaction — but the order states the contract rather than relying on the
+ * atomicity). `commitProofs` is absent and must stay absent: it is keyed by a consensus message's
+ * hash, not a block (see `BatchBackend.deleteBlock`).
+ */
+const BLOCK_SCOPED_STORES: readonly Store[] = ['metadata', 'revisions', 'proofs', 'pending', 'transactions', 'materialized'];
+
+/**
+ * `DELETE FROM <table> WHERE block_id = ?`, one per block-scoped store — every row the block owns
+ * there. `block_id` is the first key column of all six layouts above, so one predicate serves them
+ * all whatever the rest of each key is.
+ */
+const DELETE_BLOCK_SQL: readonly string[] = BLOCK_SCOPED_STORES.map(store => `DELETE FROM ${LAYOUTS[store].table} WHERE block_id = ?`);
+
 /** The key's bind parameters, in the order of its store's key columns. */
 function keyParams(key: StoreKey): SqliteParam[] {
 	switch (key.store) {
@@ -253,6 +269,37 @@ export class SqliteBatchBackend implements BatchBackend {
 	/** Hasten: one synced commit covering every batch held when it runs; with nothing held, nothing is synced. `WriteGroupSink.sync`'s contract. */
 	sync(): Promise<void> {
 		return this.syncHeld();
+	}
+
+	/**
+	 * `BatchBackend.deleteBlock`: six `DELETE … WHERE block_id = ?`, one per block-scoped table, in
+	 * ONE synced transaction — which is stronger than the contract's metadata-first ordering, since
+	 * no crash can leave the delete half-done. `commit_proofs` is untouched: its key is a consensus
+	 * message's hash, so a row may still certify revisions of blocks this node keeps.
+	 *
+	 * It is its OWN transaction rather than the {@link syncHeld} path a strict `commit` takes, and so
+	 * does NOT latch the backend when it fails: a delete is a garbage-collection write, and one that
+	 * failed must not leave the store refusing every later ordinary write (`JournalBatchBackend`
+	 * makes the same call for the same reason). Batches waiting for a sync are not settled by it
+	 * either — this `FULL` commit does sync the shared write-ahead log, and so their frames with it,
+	 * but their `durable`s wait for the next sync the deadline machinery makes. That is conservative,
+	 * never early.
+	 *
+	 * Taking the connection mutex is what orders it against those batches: a batch committed earlier
+	 * is already applied, so this transaction sees its rows and commits after it.
+	 *
+	 * Idempotent by construction: a `DELETE` matching no row is not an error, and leaves this
+	 * transaction empty with nothing to sync — which is correct, since nothing was written. Nothing
+	 * is scoped by table alone, so the key-value store's and the piece store's tables — which share
+	 * this connection — are never named.
+	 */
+	async deleteBlock(blockId: BlockId): Promise<void> {
+		this.throwIfFailed();
+		await this.db.transaction(async (tx) => {
+			for (const sql of DELETE_BLOCK_SQL) {
+				await tx.prepare(sql).run(blockId);
+			}
+		}, { synced: true });
 	}
 
 	/**

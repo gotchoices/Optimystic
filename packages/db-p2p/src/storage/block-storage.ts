@@ -403,6 +403,17 @@ export class BlockStorage implements IBlockStorage {
 		await this.storage.saveMetadata(this.blockId, meta);
 	}
 
+	/**
+	 * The latch assertion and one storage call — see {@link IBlockStorage.deleteBlock} for what the
+	 * latch is load-bearing for and `IRawStorage.deleteBlock` for the ordering and idempotence the
+	 * storage owns. Deliberately no metadata read first: there is nothing to decide, and a block
+	 * whose metadata is already gone still has content a resumed delete must remove.
+	 */
+	async deleteBlock(latch: BlockWriteLatch): Promise<void> {
+		this.assertLatch(latch);
+		await this.storage.deleteBlock(this.blockId);
+	}
+
 	async recover(latch: BlockWriteLatch): Promise<{ reconciled: boolean; latest?: ActionRev }> {
 		this.assertLatch(latch);
 		const meta = await this.storage.getMetadata(this.blockId);

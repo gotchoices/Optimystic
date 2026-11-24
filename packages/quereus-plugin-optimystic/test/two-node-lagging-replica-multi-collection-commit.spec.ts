@@ -142,6 +142,11 @@ class LaggingRawStorage implements RawStorage {
 	async promotePendingTransaction(blockId: BlockId, actionId: ActionId): Promise<void> {
 		if (!this.drop(blockId)) await this.inner.promotePendingTransaction(blockId, actionId);
 	}
+	// Not veiled: the veil models a replica that is BEHIND, and a delete is not a write the lag
+	// swallows. No test here deletes, so it only has to be wired, not shaped.
+	async deleteBlock(blockId: BlockId): Promise<void> {
+		await this.inner.deleteBlock(blockId);
+	}
 	flush(options?: FlushOptions): Promise<void> {
 		return this.inner.flush(options);
 	}

@@ -288,6 +288,28 @@ export class KvRawStorage<V extends StoredValue = Uint8Array> implements IRawSto
 		await this.driver.promote(blockId, actionId);
 	}
 
+	// --- Delete a whole block (the driver owns the ordering; see RawStoreDriver.deleteBlock) ---
+
+	/**
+	 * Nothing to compose: there is no value to encode, and the ordering the operation needs — the
+	 * metadata record removed and durable before any content store is touched — cannot be composed
+	 * here. The kernel has no metadata DELETE to call (every invalidation writes a compensating
+	 * forward revision instead), and it cannot enumerate a block's revisions to remove them one by
+	 * one: `rangeRevisions` is a bounded scan and the top revision is only knowable from the very
+	 * metadata the operation removes. Each backend has a cheap native answer for "everything under
+	 * this block" — three of the four do the whole thing in one atomic transaction or batch, which is
+	 * stronger than the ordering the contract asks for — so the operation is theirs and this is a
+	 * delegation.
+	 *
+	 * No change notification is emitted, deliberately: the block's CONTENT has not changed, this node
+	 * has merely stopped holding it, and a change event would send trackers and the reactivity layer
+	 * to re-read a block this node is no longer the place to ask. See
+	 * `packages/db-p2p/docs/storage.md` § *Deleting a block*.
+	 */
+	async deleteBlock(blockId: BlockId): Promise<void> {
+		await this.driver.deleteBlock(blockId);
+	}
+
 	// --- Flush (what a flush does is the driver's; see RawStoreDriver.flush for the contract) ---
 
 	flush(options?: FlushOptions): Promise<void> {

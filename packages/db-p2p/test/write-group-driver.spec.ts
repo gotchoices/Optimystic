@@ -270,6 +270,7 @@ describe('WriteGroupDriver', () => {
 			get: key => memory.get(key),
 			rangeRevisions: (blockId, lo, hi) => memory.rangeRevisions(blockId, lo, hi),
 			listPendingActionIds: blockId => memory.listPendingActionIds(blockId),
+			deleteBlock: blockId => memory.deleteBlock(blockId),
 			commit: (entries, options) => memory.commit(entries, options),
 			sync: () => memory.sync(),
 		};

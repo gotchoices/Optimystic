@@ -59,6 +59,18 @@ export class MemoryStoreRows {
 		}
 	}
 
+	/**
+	 * Remove every row of the six block-scoped stores for the block, leaving the commit proofs store
+	 * alone — `BatchBackend.deleteBlock`'s inventory. Exact, not prefix-matched: a row is kept with
+	 * its own {@link StoreKey}, so the block id is compared rather than parsed back out of the
+	 * canonical string.
+	 */
+	deleteBlock(blockId: BlockId): void {
+		for (const [canonical, { key }] of Array.from(this.rows)) {
+			if (key.store !== 'commitProofs' && key.blockId === blockId) this.rows.delete(canonical);
+		}
+	}
+
 	clear(): void {
 		this.rows.clear();
 	}

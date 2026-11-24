@@ -268,13 +268,8 @@ export class CachedStoreDriver<V extends StoredValue = Uint8Array> implements Ra
 	 * objects and decline to claim completeness.
 	 */
 	clear(): void {
-		for (const s of this.blocks.values()) {
-			if (s.meta) this.pool.drop(s.meta);
-			if (s.revs) this.pool.drop(s.revs);
-			if (s.pendList) this.pool.drop(s.pendList);
-			for (const e of s.pending.values()) this.pool.drop(e);
-			for (const e of s.transactions.values()) this.pool.drop(e);
-			for (const e of s.materialized.values()) this.pool.drop(e);
+		for (const blockId of Array.from(this.blocks.keys())) {
+			this.dropBlock(blockId);
 		}
 		this.blocks.clear();
 		this.pool.purgeGhosts(this.store);
@@ -958,6 +953,47 @@ export class CachedStoreDriver<V extends StoredValue = Uint8Array> implements Ra
 			// safety. Invalidate; never synthesize.
 			this.dropMapEntry(blockId, 'transactions', actionId);
 		}
+	}
+
+	// --- delete a whole block ---
+
+	/**
+	 * Drop everything cached for the block, have the inner driver remove it, then drop again
+	 * (`RawStoreDriver.deleteBlock`).
+	 *
+	 * The first drop is what the contract asks for: nothing the cache holds for the block may outlive
+	 * the store's copy, or a later read is served content the store no longer has. The second covers
+	 * the one window the first cannot — a read that was already in flight at the inner driver and
+	 * fills its entry while the delete runs. A read that STARTS after the second drop reads the
+	 * emptied store and caches a proven absence, which is correct; and the sweep above only ever
+	 * deletes a block this node has already stopped serving, so that window is theory rather than a
+	 * live race.
+	 *
+	 * Nothing is cached for the proofs or commit proofs stores (both are passthroughs — see
+	 * {@link getProof}), so a drop has nothing to do for them.
+	 */
+	async deleteBlock(blockId: BlockId): Promise<void> {
+		this.dropBlock(blockId);
+		try {
+			await this.inner.deleteBlock(blockId);
+		} finally {
+			// Also on the failure path: a rejected delete may have removed part of the block, so
+			// anything cached for it since the first drop is of unknown standing.
+			this.dropBlock(blockId);
+		}
+	}
+
+	/** Release every pool entry this cache holds for the block and forget its state — `clear()`, for one block. */
+	private dropBlock(blockId: BlockId): void {
+		const s = this.blocks.get(blockId);
+		if (s === undefined) return;
+		if (s.meta) this.pool.drop(s.meta);
+		if (s.revs) this.pool.drop(s.revs);
+		if (s.pendList) this.pool.drop(s.pendList);
+		for (const e of s.pending.values()) this.pool.drop(e);
+		for (const e of s.transactions.values()) this.pool.drop(e);
+		for (const e of s.materialized.values()) this.pool.drop(e);
+		if (this.blocks.get(blockId) === s) this.blocks.delete(blockId);
 	}
 }
 

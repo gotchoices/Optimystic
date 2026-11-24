@@ -86,6 +86,15 @@ export class MemoryJournalStore implements JournalStore {
 		return this.rows.approximateBytesUsed();
 	}
 
+	/**
+	 * Drop the block's rows from the applied stores at once (`BatchBackend.deleteBlock`). Never
+	 * journaled — the backend applies everything held before calling this — so {@link applied}
+	 * records nothing for it.
+	 */
+	async deleteBlock(blockId: BlockId): Promise<void> {
+		this.rows.deleteBlock(blockId);
+	}
+
 	// --- the journal ---
 
 	async appendJournal(record: JournalRecord): Promise<void> {

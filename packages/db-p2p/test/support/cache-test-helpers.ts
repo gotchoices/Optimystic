@@ -144,6 +144,10 @@ export class CountingStoreDriver implements RawStoreDriver {
 		this.bump('promote');
 		return this.inner.promote(blockId, actionId);
 	}
+	async deleteBlock(blockId: BlockId): Promise<void> {
+		this.bump('deleteBlock');
+		return this.inner.deleteBlock(blockId);
+	}
 	async flush(options?: FlushOptions): Promise<void> {
 		this.bump('flush');
 		return this.inner.flush(options);

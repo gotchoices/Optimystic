@@ -76,11 +76,12 @@ export interface RawStoreDriver<V extends StoredValue = Uint8Array> {
 	 * format-checked, so any reserved action-id convention could be collided with
 	 * by an ordinary write. Separate keyspaces make the collision unrepresentable.
 	 *
-	 * There is deliberately NO `deleteProof`: a proof lives and dies with its
-	 * REVISION record, and no revision-delete site exists today (`RawStoreDriver`
-	 * has no revision delete at all — invalidations write compensating FORWARD
-	 * revisions). Whatever ever deletes a revision record must delete its proof;
-	 * until such a site exists this is a contract note, not a wired path.
+	 * There is deliberately no per-revision `deleteProof`: an entry lives and dies with its REVISION
+	 * record, and the one site that removes a revision record removes a whole block's —
+	 * {@link deleteBlock}, which takes this store's entries for the block alongside the other five
+	 * block-scoped stores'. No narrower revision delete exists: invalidations write compensating
+	 * FORWARD revisions rather than removing anything, so a single revision's entry is never removed
+	 * on its own.
 	 */
 	getProof(blockId: BlockId, rev: number): Promise<V | undefined>;
 	putProof(blockId: BlockId, rev: number, value: V): Promise<void>;
@@ -92,8 +93,12 @@ export interface RawStoreDriver<V extends StoredValue = Uint8Array> {
 	 * block. The key is a hash the caller takes from the proof itself, which is trustworthy only
 	 * because every proof that reaches storage was built or verified locally.
 	 *
-	 * Deliberately NO delete, for the reason the proofs store has none: no revision-delete site
-	 * exists, so nothing could know when the last revision naming a proof is gone.
+	 * Deliberately NO delete, and {@link deleteBlock} does not touch this store either: a key names a
+	 * consensus message, not a block, so one entry may still certify revisions of blocks this node
+	 * keeps, and nothing counts how many revisions name it. So `deleteBlock` removes the deleted
+	 * block's entries in the PROOFS store and leaves the proof bodies those entries referred to in
+	 * place — orphaned when no revision of any kept block names them. Sweeping that residual is the
+	 * subject of the backlog ticket `debt-unreferenced-commit-proofs-are-never-swept`.
 	 */
 	getCommitProof(messageHash: string): Promise<V | undefined>;
 	putCommitProof(messageHash: string, value: V): Promise<void>;
@@ -112,6 +117,30 @@ export interface RawStoreDriver<V extends StoredValue = Uint8Array> {
 	 * entry exists. This is the ONLY cross-key atomic operation the kernel requires.
 	 */
 	promote(blockId: BlockId, actionId: ActionId): Promise<void>;
+
+	/**
+	 * Remove everything this driver holds for one block — the only operation that takes bytes back
+	 * off a node, for a block it has stopped being responsible for. The full contract, including the
+	 * store inventory, the ordering and the idempotence, is stated once on
+	 * `BatchBackend.deleteBlock` (`packages/db-p2p/src/storage/batch-backend.ts`) and holds
+	 * identically here; in short:
+	 *
+	 * - It removes the SIX block-scoped stores' records for the block — metadata, revisions,
+	 *   pending, transactions, materialized, proofs — and **not** the commit proofs store, which is
+	 *   keyed by a consensus message's hash and so holds entries shared with blocks this node keeps
+	 *   (see {@link getCommitProof}).
+	 * - Metadata first, durably, then the rest: a crash in the middle leaves content with no
+	 *   metadata, never metadata whose revision records are gone.
+	 * - Idempotent, so a sweep may re-run it for the same block id after a restart.
+	 * - The caller holds the block's write latch.
+	 *
+	 * Required, not optional, for the reason {@link flush} and {@link whenDurable} are: a wrapper
+	 * that forgot to forward it would silently leave the bytes on disk, and the type checker refuses
+	 * that. Each wrapper has its own work to do first — `WriteGroupDriver` flushes its group so no
+	 * overlay put can be applied after the delete and resurrect the block, and `CachedStoreDriver`
+	 * drops what it caches for the block so no later read is served content the store no longer has.
+	 */
+	deleteBlock(blockId: BlockId): Promise<void>;
 
 	/**
 	 * Make every write that resolved before this call survive the crashes {@link durability} names,
@@ -227,7 +256,9 @@ export interface RawStoreDriver<V extends StoredValue = Uint8Array> {
 	// wrapper over a `RawStoreDriver` appears, replace the per-wrapper tests with one shared
 	// conformance check that asserts forwarding of each optional, with an explicit per-wrapper
 	// exception list.
-	// `flush` and `durability` are REQUIRED for exactly that reason: a wrapper that forgot `flush`
-	// would resolve a flush without reaching the store underneath, and one that forgot
-	// `durability` would leave the composition's guarantee unstated, so the type checker refuses both.
+	// `flush`, `durability` and `deleteBlock` are REQUIRED for exactly that reason: a wrapper that
+	// forgot `flush` would resolve a flush without reaching the store underneath, one that forgot
+	// `durability` would leave the composition's guarantee unstated, and one that forgot
+	// `deleteBlock` would report a block deleted with every byte of it still on disk — so the type
+	// checker refuses all three.
 }

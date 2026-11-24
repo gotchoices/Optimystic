@@ -21,11 +21,12 @@ export type BatchEntry = WriteGroupEntry<StoreKey>;
 
 /**
  * The backend under a {@link WriteGroupDriver}: reads, listings, and the write group's sink — ONE
- * write, `commit`, that applies a whole batch at once, and `sync`, which hastens the batches whose
- * sync `commit` was allowed to defer (the contract of both is on `WriteGroupSink`). The driver holds
- * every write in memory and serves it from there until a `flush()` hands the group here, so a
+ * batched write, `commit`, that applies a whole batch at once, and `sync`, which hastens the batches
+ * whose sync `commit` was allowed to defer (the contract of both is on `WriteGroupSink`). The driver
+ * holds every write in memory and serves it from there until a `flush()` hands the group here, so a
  * backend never sees a single put or delete, and the atomicity `promote` needs is the batch's (a
- * promote is two entries of one batch). A `commit` resolves once the batch is applied and survives a
+ * promote is two entries of one batch). {@link BatchBackend.deleteBlock} is the one write that is
+ * NOT a batch entry, for the reason stated at its site. A `commit` resolves once the batch is applied and survives a
  * crash of this process; with `syncWithinMs` 0 it also syncs this and every earlier batch before
  * resolving, and returns an already-settled `durable`. A backend that cannot defer treats every
  * value as 0. Rejecting is a storage fault: the driver then refuses every later write and flush
@@ -49,6 +50,37 @@ export interface BatchBackend<R extends StoredValue = Uint8Array> extends WriteG
 	rangeRevisions(blockId: BlockId, lo: number, hi: number): Promise<[number, R][]>;
 	/** Every present pending action id for the block, fully drained. */
 	listPendingActionIds(blockId: BlockId): Promise<ActionId[]>;
+	/**
+	 * Remove every record this backend holds for `blockId` — the one operation that takes bytes back
+	 * off a node, for a block it has stopped being responsible for. Not part of the write group: it is
+	 * the backend's own write, because no composition above can enumerate a block's revisions (
+	 * `rangeRevisions` is a bounded `[lo, hi]` scan, and the top revision is only knowable from the
+	 * metadata this operation is itself removing), while every backend has a cheap native answer for
+	 * "everything under this block".
+	 *
+	 * **The six block-scoped stores, and only those:** metadata, revisions, pending, transactions,
+	 * materialized, proofs. The seventh, **commit proofs, is deliberately left alone** — it is keyed
+	 * by a consensus message's hash alone, one entry per message however many blocks that message
+	 * covered, so an entry may still certify revisions of blocks this node keeps, and the key shape
+	 * admits no per-block delete (see `RawStoreDriver.getCommitProof`). Nor may it touch what shares
+	 * the backend's database or directory with those six: the key-value store's namespaces
+	 * (`NODE_KV_NAMESPACES`), the piece store, and the journal.
+	 *
+	 * **Not atomic across stores, but ORDERED.** The metadata record goes first and its removal is
+	 * durable — as far as {@link durability} allows — before any content store is touched. So a crash
+	 * in the middle leaves content with no metadata: bytes nothing serves and no listing reports,
+	 * which a later call finishes removing. It must never leave the reverse, metadata naming a
+	 * `latest` whose revision record is gone, which reads as a block this node holds and then throws
+	 * inside materialization. The content stores' removal need NOT be durable when this resolves.
+	 *
+	 * **Idempotent.** On a block whose metadata is already gone it still removes whatever content is
+	 * there; on a block with nothing at all it resolves quietly. That is what lets a sweep re-run it
+	 * for the same block id after a restart.
+	 *
+	 * The caller holds the block's write latch (Invariant 2 of `packages/db-p2p/docs/storage.md`), so
+	 * no write to the block can interleave with it.
+	 */
+	deleteBlock(blockId: BlockId): Promise<void>;
 	/** Optional, with the contract of `RawStoreDriver.storeIdentity`. Omit rather than stub. */
 	storeIdentity?(): StoreIdentity;
 	/** Optional — every block id with metadata, as `RawStoreDriver.listBlockIds`. Omit rather than stub. */

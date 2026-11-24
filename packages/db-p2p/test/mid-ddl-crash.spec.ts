@@ -156,6 +156,9 @@ class CrashingRawStorage implements IRawStorage {
 	promotePendingTransaction(blockId: BlockId, actionId: ActionId) {
 		return this.invoke('promotePendingTransaction', [blockId, actionId], blockId, actionId, () => this.inner.promotePendingTransaction(blockId, actionId));
 	}
+	deleteBlock(blockId: BlockId) {
+		return this.invoke('deleteBlock', [blockId], blockId, undefined, () => this.inner.deleteBlock(blockId));
+	}
 	flush(options?: FlushOptions) {
 		return this.invoke('flush', [options], undefined, undefined, () => this.inner.flush(options));
 	}

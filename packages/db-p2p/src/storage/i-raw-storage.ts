@@ -34,12 +34,13 @@ export interface IRawStorage {
 	saveTransaction(blockId: BlockId, actionId: ActionId, transform: Transform): Promise<void>;
 
 	/**
-	 * The commit proof stored for a revision, if one was retained. Keyed by revision: the proof lives
+	 * The commit proof stored for a revision, if one was retained. Keyed by revision: the entry lives
 	 * and dies with the REVISION record, not the materialization, so the checkpoint sweep
 	 * (`pruneSupersededMaterialization`) never touches it — that is what lets it outlive the
-	 * 60-second in-memory commit-cert TTL. Whatever deletes a revision record must delete its proof;
-	 * no such site exists today (`RawStoreDriver` has no revision delete at all — invalidations write
-	 * compensating FORWARD revisions), so this is a contract note, not a wired path.
+	 * 60-second in-memory commit-cert TTL. The one site that removes a revision record removes a
+	 * whole block's, {@link deleteBlock}, and it removes this store's ENTRIES for that block with
+	 * them; there is no narrower revision delete (invalidations write compensating FORWARD
+	 * revisions), so a single revision's entry is never removed on its own.
 	 *
 	 * Composed: the revision's entry ({@link getProofEntry}) is usually a {@link ProofRef}, resolved
 	 * through {@link getCommitProof}; an entry holding a whole proof (an earlier build's) is returned
@@ -55,9 +56,14 @@ export interface IRawStorage {
 	 *
 	 * Precondition: `proof.messageHash` is the hash of `proof.message`. Every proof reaching here was
 	 * built on this node from its own consensus record, minted by this node, or verified (which
-	 * recomputes the hash and refuses a mismatch); nothing here checks it. A stored proof is kept as
-	 * long as any revision refers to it — forever, since no revision-delete site exists. A site that
-	 * ever deletes revisions must count or sweep the commit proofs it leaves unreferenced.
+	 * recomputes the hash and refuses a mismatch); nothing here checks it.
+	 *
+	 * A stored proof is never deleted. {@link deleteBlock} removes the deleted block's ENTRIES in the
+	 * proofs store, but not the proof bodies they referred to: a body is keyed by its consensus
+	 * message's hash, one per message however many blocks it covered, so it may still certify
+	 * revisions of blocks this node keeps, and nothing counts how many revisions name it. A body no
+	 * revision names any more therefore stays on disk — the residual the backlog ticket
+	 * `debt-unreferenced-commit-proofs-are-never-swept` is about.
 	 */
 	saveBlockProof(blockId: BlockId, rev: number, proof: BlockCommitProof): Promise<void>;
 
@@ -74,7 +80,9 @@ export interface IRawStorage {
 	/**
 	 * The commit proof stored under a consensus message's hash (`BlockCommitProof.messageHash`), one
 	 * per message however many blocks it covers. Raw access only: what to store here and when to read
-	 * it is the caller's, and no delete exists, for the reason {@link getBlockProof}'s store has none.
+	 * it is the caller's. No delete exists, and {@link deleteBlock} does not touch this store: a key
+	 * names a message, not a block, so one entry may still certify revisions of blocks this node
+	 * keeps. See {@link saveBlockProof} for what that leaves behind.
 	 */
 	getCommitProof(messageHash: string): Promise<BlockCommitProof | undefined>;
 	saveCommitProof(messageHash: string, proof: BlockCommitProof): Promise<void>;
@@ -85,6 +93,28 @@ export interface IRawStorage {
 
 	// Promote a pending action to a committed action
 	promotePendingTransaction(blockId: BlockId, actionId: ActionId): Promise<void>;
+
+	/**
+	 * Remove everything this storage holds for one block — the only operation that takes bytes back
+	 * off a node, for a block it has stopped being responsible for. The contract is stated in full on
+	 * `RawStoreDriver.deleteBlock` and `BatchBackend.deleteBlock`
+	 * (`packages/db-p2p/src/storage/batch-backend.ts`) and holds identically here:
+	 *
+	 * - It removes the SIX block-scoped stores' records for the block — metadata, revisions,
+	 *   pending, transactions, materialized, proofs — and NOT the commit proofs store (see
+	 *   {@link getCommitProof}).
+	 * - Metadata first and durably, then the rest: a crash in the middle leaves content with no
+	 *   metadata, which reads as a block this node does not hold; never the reverse.
+	 * - Idempotent, so a sweep may re-run it for the same block id after a restart.
+	 * - It emits no change notification: the block's content has not changed, this node has stopped
+	 *   holding it.
+	 *
+	 * Callers go through {@link IBlockStorage.deleteBlock}, which takes the block's write latch —
+	 * Invariant 2 of `packages/db-p2p/docs/storage.md`, and a delete is the widest write there is.
+	 * Required, not optional, for the reason {@link flush} is: a wrapper that forgot to forward it
+	 * would report a block deleted with every byte of it still on disk.
+	 */
+	deleteBlock(blockId: BlockId): Promise<void>;
 
 	/**
 	 * Make every write that resolved before this call survive the crashes {@link durability} names,

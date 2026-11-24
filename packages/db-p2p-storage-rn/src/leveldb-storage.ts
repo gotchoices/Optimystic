@@ -22,7 +22,12 @@ import {
 import { LEVELDB_HANDLE_SCHEME, drain, type LevelDBIteratorOptions, type LevelDBLike, type LevelDBWriteBatchLike } from './leveldb-like.js';
 import { measurePieces } from './leveldb-piece-store.js';
 import {
+	TAG_MATERIALIZED,
+	TAG_METADATA,
 	TAG_PENDING,
+	TAG_PROOFS,
+	TAG_REVISIONS,
+	TAG_TRANSACTIONS,
 	actionIdFromKey,
 	blockEnvelopeRange,
 	blockIdFromMetadataKey,
@@ -67,6 +72,16 @@ function keyBytes(key: StoreKey): Uint8Array {
 			return materializedKey(key.blockId, key.actionId);
 	}
 }
+
+/**
+ * The tags `deleteBlock` empties, metadata first — the six block-scoped stores. `TAG_COMMIT_PROOFS`
+ * is absent and must stay absent: its keys name consensus messages, not blocks (see
+ * `BatchBackend.deleteBlock`). So are the tags of everything else sharing the handle — the journal,
+ * the pieces, the key-value store and the identity key.
+ */
+const BLOCK_SCOPED_TAGS: readonly number[] = [
+	TAG_METADATA, TAG_REVISIONS, TAG_PROOFS, TAG_PENDING, TAG_TRANSACTIONS, TAG_MATERIALIZED,
+];
 
 /**
  * LevelDB {@link JournalStore}: the seven logical block-storage stores mapped into a single ordered
@@ -204,6 +219,36 @@ export class LevelDBJournalStore implements JournalStore<string> {
 			await iter.close();
 		}
 		return total;
+	}
+
+	// --- delete a whole block ---
+
+	/**
+	 * `BatchBackend.deleteBlock`: one batch deleting every key in the block's envelope range under
+	 * each of the six block-scoped tags, synced wherever the handle can sync. A LevelDB batch is
+	 * atomic, so no crash leaves the delete half-done — stronger than the contract's metadata-first
+	 * ordering, which the tag order below states anyway.
+	 *
+	 * Scoped by the key envelope, which is what keeps the other tags sharing this database out of it:
+	 * `TAG_COMMIT_PROOFS` (keyed by a consensus message's hash, so a key may still certify revisions
+	 * of blocks this node keeps), `TAG_JOURNAL`, `TAG_PIECES`, `TAG_KV` and `TAG_IDENTITY` are not
+	 * named. The envelope length-prefixes the block id, so block `a`'s range cannot reach block
+	 * `a/b`'s keys.
+	 *
+	 * Idempotent: a block with no keys scans nothing and writes an empty batch.
+	 */
+	// NOTE: scan-then-delete, one key at a time, because `LevelDBWriteBatchLike` has no range delete
+	// (neither does `rn-leveldb`). The scan is bounded by what the block holds, and a delete is never
+	// on a read or commit path; if a sweep of a store with very long block histories ever shows up as
+	// slow, batch the ranges in chunks rather than holding every key of a block at once.
+	async deleteBlock(blockId: BlockId): Promise<void> {
+		const batch = this.db.batch();
+		for (const tag of BLOCK_SCOPED_TAGS) {
+			const range = blockEnvelopeRange(tag, blockId);
+			const entries = await drain(this.db.iterator({ gte: range.gte, lt: range.lt, keys: true }));
+			for (const [key] of entries) batch.delete(key);
+		}
+		await batch.write({ sync: this.db.canSync });
 	}
 
 	// --- the journal ---
