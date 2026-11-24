@@ -144,7 +144,7 @@ write.
 
 #### Deleting a block
 
-`IBlockStorage.deleteBlock(latch)` is the one operation that takes bytes back off a node: it removes every record this node holds for one block. Nothing else removes anything of a block's — an invalidation writes a compensating *forward* revision rather than erasing the one it reverses, and the only other delete in the whole surface is of one pending record. Its caller is a sweep over blocks the node has released responsibility for; the ring handoff is what releases a range safely (`docs/arachnode-ring-handoff.md` § Part 2, Phase C) and collects the released ids.
+`IBlockStorage.deleteBlock(latch)` is the one operation that takes bytes back off a node: it removes every record this node holds for one block. Nothing else removes anything of a block's — an invalidation writes a compensating *forward* revision rather than erasing the one it reverses, and the only other delete in the whole surface is of one pending record. Its one caller is `StorageRepo.deleteBlockIfNotAdvanced`, through which the released-block sweep deletes the blocks this node has handed over; the ring handoff is what releases a range safely ([docs/arachnode-ring-handoff.md § Local bytes vs. tracking](../../../docs/arachnode-ring-handoff.md#local-bytes-vs-tracking)) and *The released-block sweep* below is which blocks may be given to it.
 
 **It holds the block's write latch**, which is why it is on `IBlockStorage` and takes a token rather than being a plain storage call. A delete is the widest write there is: a pend or a commit interleaving with it would write records back under a block whose metadata has just gone, leaving content no listing reports and no read serves. `BlockStorage.deleteBlock` therefore `assertLatch`es exactly as every other writer does, and the sweep acquires the latch the ordinary way.
 
@@ -155,6 +155,28 @@ write.
 **It emits no change notification.** Every other write path emits a collection change so trackers and the reactivity layer see it. A delete emits nothing, deliberately: the block's *content* has not changed, this node has merely stopped holding it, and a change event would send readers to re-read a block this node is no longer the place to ask. A reader that still wants the block is served by the rest of the cohort, and a later local read repairs from it through `RestorationCoordinator`, exactly as for any block this node does not hold. For the same reason the delete does not touch the resilience monitors' owned-block set: a released block is untracked at Phase C, before it is ever eligible.
 
 **It is not a network delete.** Removing a block some peer still expects this node to serve loses data for the cohort. Which blocks may be given to it — and the durable ledger that makes a half-done delete resumable across a restart — belong to the sweep, not to this operation.
+
+#### The released-block sweep
+
+The rule about which blocks may be given to `deleteBlock` is one sentence, and everything below is in service of it:
+
+> **A block's bytes are deleted only after a release that confirmed at least the replication floor of other serving holders hold a current replica of it.**
+
+**The ledger is what says so, and the only thing that does.** `ReleasedBlockLedger` (`packages/db-p2p/src/storage/released-block-ledger.ts`) keeps one entry per released block under the `optimystic-released/` key namespace of the node's `IKVStore` (§8), carrying when the release happened, which path released it — a ring shift's Phase C, or the confirmed rebalance release — and the committed revision this node held at the time. Exactly two code paths write it, both inside the node factory's Arachnode gate and both strictly after a confirmation; nothing else may.
+
+**The sweep derives nothing.** `ReleasedBlockSweep` (`packages/db-p2p/src/storage/released-block-sweep.ts`) reads the ledger and, per entry, calls `StorageRepo.deleteBlockIfNotAdvanced` and then drops the entry. It never consults this node's ring, partition or owned-block set: mid-shift the advertised partition is the *target* ring, so a block that merely looks outside this node's slice may be one whose handoff rolled back and is still being served. Reading the ledger instead of re-deriving is what makes that class of bug unreachable rather than merely avoided.
+
+**The entry outlives the delete.** It is dropped *after* the delete, which is why `deleteBlock` is required to be ordered and idempotent: a crash in between leaves content with no metadata plus an entry, and the next run finishes it. The reverse order would lose the knowledge that the bytes are free the moment a crash caught a delete half-done — which is also why the entry is durable rather than re-derived from the node's partition after a restart.
+
+**A block written again since its release is kept.** A peer may push the same block back (the receiver is idempotent, and three producers may push one block), and a commit may still be routed here mid-transition. `deleteBlockIfNotAdvanced` therefore re-reads the block's `latest` **under the same hold of the write latch** as the delete and declines when it has advanced past the revision the entry recorded, dropping the entry without deleting. Keeping those bytes is harmless — the node is not responsible for the block and the cohort holds it to the floor — while deleting them would have the node delete a block it has just accepted. The block is also offered again rather than left stranded: a push or commit that advanced `latest` emitted a collection change, which the node's owned-block feed turns back into a tracked block, so the next rebalance pass releases it again if its cohort has still moved on — and that release records a fresh entry carrying the revision it now holds. That refresh is why a re-release rewrites an existing entry rather than leaving it. A push of a revision this node already held advances nothing and emits nothing, so such a block is deleted, which is right: nothing new was accepted.
+
+**What runs it, and what bounds it.** A release that wrote entries asks for a run, so an ordinary shed frees its bytes promptly; a pressure sample at `shedding` or above asks for one, so a node under pressure finishes whatever a previous run left; and one runs shortly after start-up, which is what finishes the deletes a crash interrupted. Runs never overlap (single-flight with one queued follow-on, the shape `BlobCacheBudget` uses) and each takes at most `DEFAULT_RELEASED_BLOCK_SWEEP_LIMIT` entries, so a node that released tens of thousands does not hold the event loop for one pass — the ledger is what makes stopping partway safe, and `list` orders oldest release first so each run makes progress. A run that left actionable entries behind **asks for the next one itself**, because the triggers above may not come again: a node that dropped below `shedAbove` by deleting these very blocks samples no further request, and nothing else asks until the next release. The chain terminates because every entry a run acts on is deleted, dropped, or counted one attempt toward the bound past which it is passed over. An entry whose delete keeps failing is retried three times (`RELEASED_BLOCK_DELETE_ATTEMPTS`) and then passed over, still in the ledger, so an operator can see that the block was released and not deleted; nothing silently drops an entry, which would leak the bytes *and* the record of them.
+
+**The blob half is the existing piece sweep.** A run that deleted anything asks `LocalBlobService.sweep` once. Nothing new is built for it: a blob's holds are released by the blob reclaim pass and the cohort reaction, and the piece sweep already removes the pieces no remaining hold needs (docs/blobs.md §Lifetime).
+
+**It runs on a serving node only.** The sweep's one write is a block delete, and a client node (§8) has no `StorageRepo`: nothing reads its block store, and no writer can record an entry on it either, since both release paths are inside the serving role. A client's sweep would be a second handle onto a store nothing else uses, deleting entries nothing can have written.
+
+**What it cannot free.** A block whose handoff never confirmed is never released, so it is never recorded and never swept: it stays on this node, served, indefinitely. That is the safe direction, and it means the sweep cannot be relied on to free a node whose handoffs keep failing (`tickets/backlog/bug-a-block-kept-after-a-failed-handoff-is-never-offered-again.md`). §10's table of levers says what else this one cannot reach.
 
 ### 3. Committed revisions are append-only; `latest` never advances past a materializable revision
 
@@ -1252,7 +1274,7 @@ Which parts each role uses:
 | Part | Serving node | Client (`servesBlocks: false`) |
 |---|---|---|
 | `blocks` | yes — block revisions and their commit proofs, behind the read cache (§6) | never read; it stores no blocks for anyone |
-| `kv` | yes — the blob records, the owed-blob and under-replication ledgers, the HLC clock's high-water mark, the node's transaction state (each prefix in `NODE_KV_NAMESPACES`) | yes — the high-water mark, the blob records and the owed-blob ledger |
+| `kv` | yes — the blob records, the owed-blob, under-replication and released-block ledgers, the HLC clock's high-water mark, the node's transaction state (each prefix in `NODE_KV_NAMESPACES`) | yes — the high-water mark, the blob records and the owed-blob ledger |
 | `pieces` | yes | yes — a client is often the only machine holding a blob its host put |
 
 `blocks` is required on both roles so that one value serves either and a host that changes the role changes one flag; an unused block store over a location the node already holds costs nothing, since every backend's constructor is lazy. There is no field for the transaction-state store: the node builds that over `kv` (`PersistentTransactionStateStore`), so the rule for it is stated once and holds on every platform.
@@ -1349,13 +1371,15 @@ A node hovering at `refuseAbove` logs a stage change per sample. That is accepte
 
 **The read cache shrinks as the node fills.** `cacheBudgetBytes` (§9) already falls to 0 as other use fills the allotment, but `BlobCacheBudget` is enforced only after a read or fetch that pulled something — so a node filling up with blocks kept every cached blob until some read happened to arrive. A sample at `shedding` or above now requests one enforcement, which is the trigger the cache was missing. The budget figure itself needed no change.
 
+**A full node also sweeps what it released.** The same sample asks the released-block sweep to run (*The released-block sweep*, under Invariant 2). That trigger is not what makes an ordinary shed free its bytes — the release itself asks for a run — it is what finishes whatever a previous run left: entries beyond one run's cap, and the deletes a crash interrupted. Both reactions are asked in their own `try`, so one subsystem's fault neither disarms the other nor takes the sampler down; a refusal logs `pressure:trigger-refused` naming which trigger it was.
+
 **What a node at its limit can and cannot free.** This is the honest limit of the whole chain, and it is why the order is shed, then delete, then refuse rather than shed alone. A node at `refusing` has four levers, and each has a ceiling:
 
 | Lever | What it can free |
 |---|---|
 | Evicting the read cache | at most what the cache holds, which is capped at an eighth of the allotment (§9) and is often far less |
 | Narrowing the ring | only once the handoff confirms other holders, which needs peers with room |
-| Deleting what it released | only what narrowing handed over |
+| Deleting what it released | only what narrowing handed over, and only once the handoff confirmed it (*The released-block sweep*, under Invariant 2) |
 | The blob reclaim pass | only blobs no reference tree lists, after a seven-day grace |
 
 None of the four touches **old revisions of blocks the node is still responsible for**, and on a long-lived node that is where the bytes accumulate. So a node whose use is mostly block history **cannot get back under its allotment** with these mechanisms: it reaches `refusing` and stays there until an operator raises the allotment or its peers take its ranges. The missing lever is offloading cold history and restoring it from the network on demand (`tickets/backlog/feat-cold-range-transform-offload.md`), which should be driven by this same reading. The chain is incomplete without it.

@@ -231,10 +231,11 @@ keeps the range.
 ### Phase C — release-old-range
 
 Only now: set `status='active'` at the new ring, stop serving and stop spreading the shed range
-(the authoritative `untrackBlock` / spread self-prune), and mark the shed range's local bytes
-GC-eligible. Because release happens strictly after Phase B confirmed ≥ N *other* serving holders,
-the serving replica count for every shed key never dips below N — the invariant holds across the
-release instant.
+(the authoritative `untrackBlock` / spread self-prune), and record the shed range in this node's
+**released-block ledger** (`ReleasedBlockLedger` in
+`packages/db-p2p/src/storage/released-block-ledger.ts`). Because release happens strictly after Phase
+B confirmed ≥ N *other* serving holders, the serving replica count for every shed key never dips below
+N — the invariant holds across the release instant.
 
 **Move-in needs no release phase.** A node moving in only *gains* keyspace and sheds nothing, so the
 floor is never at risk from the mover. It still uses Phase A (advertise) so peers observe the
@@ -245,6 +246,38 @@ arachnode ring depth playing no part — so it delivers the gained half only whe
 places the mover in that block's cohort. What always delivers it is read repair on first access; the
 `NOTE:` at `moveIn` in `packages/db-p2p/src/storage/ring-shift-coordinator.ts` records what that
 costs and when a fetch phase would be worth adding.
+
+### Local bytes vs. tracking
+
+Untracking stops this node serving and spreading a block. It does not take the bytes: that is the
+released-block ledger's entry plus the sweep that reads it (`ReleasedBlockSweep` in
+`packages/db-p2p/src/storage/released-block-sweep.ts`), and the rule the whole handoff exists to
+enforce is stated over that pair:
+
+> **A block's bytes are deleted only after a release that confirmed at least the replication floor of
+> other serving holders hold a current replica of it.**
+
+Three consequences worth stating, because each is a way that rule could be lost:
+
+- **The ledger is the sweep's only input.** The sweep never works out eligibility from this node's own
+  ring or partition. Mid-shift the advertised partition is the *target* ring, so a block that looks
+  outside this node's slice may be one whose Phase B is still running or whose handoff rolled back —
+  and is still being served. Only a release that followed a confirmation writes an entry.
+- **The entry is durable, and outlives the delete it records.** A restart must not forget which bytes
+  are free to go, and the sweep's `deleteBlock` is ordered and idempotent
+  ([storage.md § Deleting a block](../packages/db-p2p/docs/storage.md#deleting-a-block)) precisely so
+  the entry can be dropped *after* the delete. A crash mid-delete therefore leaves content with no
+  metadata and an entry that the next run finishes.
+- **A block whose handoff never confirmed is never swept.** Nothing releases it, so nothing records
+  it, so its bytes stay on this node — served, for ever. That is the safe direction, and it is also
+  why the sweep cannot be relied on to free a node whose handoffs keep failing: see
+  `tickets/backlog/bug-a-block-kept-after-a-failed-handoff-is-never-offered-again.md` for the lost
+  block that is never offered again.
+
+The sweep runs when a release has just written entries, when the node's pressure reading is at
+`shedding` or above, and once shortly after start-up; it is bounded per run, and the ledger is what
+makes stopping partway safe. [storage.md §10](../packages/db-p2p/docs/storage.md#10-how-full-is-too-full)
+has the triggers and the ceiling on what it can free.
 
 ## Part 3 — Interactions & edge cases (the adversarial surface)
 
@@ -336,6 +369,14 @@ coordinator rather than inline in `libp2p-node-base.ts`:
   (bounded by `growthMaxAttempts`, retried by the `growthRecheckIntervalMs` timer).
 - `packages/db-p2p/src/storage/arachnode-fret-adapter.ts` — `status` transitions and the `moveFrom`
   field advertised through Phase A (the old range a `moving` node still serves).
+- `packages/db-p2p/src/storage/released-block-ledger.ts` — the durable record of what Phase C and the
+  confirmed rebalance release have released: `ReleasedBlockLedger.record` (the only writer, called from
+  those two paths and nowhere else) and the per-entry revision the sweep's written-again check reads.
+- `packages/db-p2p/src/storage/released-block-sweep.ts` — `ReleasedBlockSweep.sweep` deletes what the
+  ledger lists and nothing else, bounded per run, single-flight with one queued follow-on. The delete
+  itself is `StorageRepo.deleteBlockIfNotAdvanced`, which takes the block's write latch and declines a
+  block written again since its release.
 - `packages/db-p2p/src/libp2p-node-base.ts` — wires the coordinator (driven off the damped
-  `shouldTransition` trigger), the gated rebalance release, and the `gcEligibleBlocks` set the future
-  storage sweep must consult before reclaiming any released range.
+  `shouldTransition` trigger), the gated rebalance release, the `recordReleased` callback both release
+  paths write the ledger through (inside the Arachnode gate), and the sweep itself (outside it, so a
+  node whose FRET service is absent this run still finishes what a previous run left recorded).

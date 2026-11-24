@@ -41,7 +41,7 @@ export interface NodeStorage {
 	 */
 	blocks: IRawStorage;
 	/**
-	 * Node-local records: the blob records, the owed-blob and under-replication ledgers, the clock's
+	 * Node-local records: the blob records, the owed-blob, under-replication and released-block ledgers, the clock's
 	 * high-water mark, the node's transaction state. Each namespace's key prefix is declared in
 	 * `NODE_KV_NAMESPACES` (`packages/db-p2p/src/storage/node-kv-namespaces.ts`), which is what keeps
 	 * a file-backed store sharing the block store's directory from listing them as blocks.

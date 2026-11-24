@@ -113,6 +113,13 @@ export interface StoragePressureDeps {
 	 * returns nothing.
 	 */
 	readonly requestCacheEnforcement?: () => void;
+	/**
+	 * Ask the released-block sweep to run, called after a read that landed at `shedding` or above. It
+	 * is what makes a node under pressure finish whatever a previous run left behind — a run stopped by
+	 * its per-run cap, or a delete a crash interrupted — without waiting for the next release.
+	 * `ReleasedBlockSweep.request()` logs rather than rejects, which is why this returns nothing.
+	 */
+	readonly requestReleasedBlockSweep?: () => void;
 	/** Default {@link DEFAULT_PRESSURE_SAMPLE_INTERVAL_MS}. */
 	readonly sampleIntervalMs?: number;
 	/**
@@ -197,6 +204,7 @@ export class StoragePressure {
 	private readonly account: Pick<StorageAccount, 'capacity'>;
 	private readonly thresholds: StoragePressureThresholds;
 	private readonly requestCacheEnforcement: (() => void) | undefined;
+	private readonly requestReleasedBlockSweep: (() => void) | undefined;
 	private readonly sampleIntervalMs: number;
 	private readonly firstSampleDelayMs: number;
 	private readonly setTimer: (fn: () => void, ms: number) => () => void;
@@ -216,6 +224,7 @@ export class StoragePressure {
 		this.account = deps.account;
 		this.thresholds = deps.thresholds;
 		this.requestCacheEnforcement = deps.requestCacheEnforcement;
+		this.requestReleasedBlockSweep = deps.requestReleasedBlockSweep;
 		this.sampleIntervalMs = deps.sampleIntervalMs ?? DEFAULT_PRESSURE_SAMPLE_INTERVAL_MS;
 		this.firstSampleDelayMs = deps.firstSampleDelayMs ?? 0;
 		this.setTimer = deps.setTimer ?? armUnrefTimer;
@@ -312,22 +321,40 @@ export class StoragePressure {
 		}
 		this.measured = true;
 		this.lastStage = stage;
-		// Supplies the trigger the read cache was missing. `request()` logs rather than rejects, and is
-		// single-flight with one queued follow-on, so asking every sample costs at most one pass.
-		//
-		// Caught even though today's trigger cannot throw synchronously, because the re-arm is BELOW it:
-		// a trigger that threw would take the sampler down for the life of the node, and every gate
-		// would then read a stage frozen at whatever it last measured. One subsystem's fault must not
-		// disarm the node's reading of its own disk.
 		if (atLeastPressure(stage, 'shedding')) {
-			try {
-				this.requestCacheEnforcement?.();
-			} catch (error) {
-				this.log('pressure:enforcement-refused stage=%s - %e', stage, error);
-			}
+			this.requestSheddingReactions(stage);
 		}
 		this.reschedule();
 		return { stage, capacity };
+	}
+
+	/**
+	 * The reactions a sample at `shedding` or above asks for: the read cache's enforcement (the trigger
+	 * it was missing — `cacheBudgetBytes` already falls to 0 as other use fills the allotment, but the
+	 * budget is otherwise enforced only after a read that pulled something) and the released-block
+	 * sweep (which finishes what a previous run's cap or a crash left in its ledger).
+	 *
+	 * Each is single-flight with one queued follow-on, so asking every sample costs at most one pass of
+	 * each.
+	 */
+	private requestSheddingReactions(stage: StoragePressureStage): void {
+		this.fireTrigger('cache-enforcement', stage, this.requestCacheEnforcement);
+		this.fireTrigger('released-block-sweep', stage, this.requestReleasedBlockSweep);
+	}
+
+	/**
+	 * One reaction, isolated. Caught even though no shipping trigger can throw synchronously, because
+	 * the sample's re-arm is BELOW the call: a trigger that threw would take the sampler down for the
+	 * life of the node, and every gate would then read a stage frozen at whatever it last measured. One
+	 * subsystem's fault must not disarm the node's reading of its own disk, nor keep the other reaction
+	 * from being asked.
+	 */
+	private fireTrigger(name: string, stage: StoragePressureStage, trigger: (() => void) | undefined): void {
+		try {
+			trigger?.();
+		} catch (error) {
+			this.log('pressure:trigger-refused trigger=%s stage=%s - %e', name, stage, error);
+		}
 	}
 
 	/** Each sample re-arms the next `sampleIntervalMs` after this one ENDS, so samples never overlap. */

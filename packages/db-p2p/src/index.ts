@@ -82,6 +82,8 @@ export * from "./storage/struct.js";
 export * from "./storage/pending-claim.js";
 export * from "./storage/block-archive.js";
 export * from "./storage/storage-repo.js";
+export * from "./storage/released-block-ledger.js";
+export * from "./storage/released-block-sweep.js";
 export * from "./storage/restoration-coordinator.js";
 export * from "./storage/ring-selector.js";
 export * from "./storage/storage-account.js";

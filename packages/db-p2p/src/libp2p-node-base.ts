@@ -84,6 +84,8 @@ import { resolveBootstrapContactTimeoutMs, resolveLibp2pDialTimeoutMs, resolveLi
 import type { ClusterLatestAnswer, ClusterLatestCallback } from './repo/coordinator-repo.js';
 import type { ClusterLatestBatchCallback } from './repo/consult-round.js';
 import { RestorationCoordinator } from './storage/restoration-coordinator.js';
+import { ReleasedBlockLedger, type ReleaseSource } from './storage/released-block-ledger.js';
+import { ReleasedBlockSweep } from './storage/released-block-sweep.js';
 import { DEFAULT_MIN_RING_CAPACITY_BYTES, MAX_RING_DEPTH, RingSelector } from './storage/ring-selector.js';
 import { RingShiftCoordinator } from './storage/ring-shift-coordinator.js';
 import { cacheBudgetBytes, StorageAccount } from './storage/storage-account.js';
@@ -1110,6 +1112,14 @@ interface LateServingBindings {
 	coordinatedRepo?: IRepo;
 	/** Where block-holder evidence goes: the rebalance monitor, when one is built. */
 	blockHolders?: BlockHoldersSink;
+	/**
+	 * Ask the released-block sweep to run, bound once the sweep exists. Late-bound because the two
+	 * release callbacks that write the ledger are wired deep inside the Arachnode gate, while the sweep
+	 * is built after the node has started, beside the blob service whose piece sweep it asks for. Until
+	 * it is bound a release records its entries and nothing sweeps them until the next trigger — a
+	 * pressure sample at `shedding`, or the next start-up.
+	 */
+	requestReleasedBlockSweep?: () => void;
 }
 
 /**
@@ -1122,6 +1132,13 @@ interface ServingStore {
 	lease: ReadCacheLease | undefined;
 	storageRepo: StorageRepo;
 	underReplicationLedger: KvUnderReplicationLedger;
+	/**
+	 * Which blocks this node has released and may delete its own copy of — written only by the two
+	 * confirmed-release callbacks inside the Arachnode gate, read by the released-block sweep. Built
+	 * here, over the same key-value store as the other ledgers, so it is exactly as durable as the rest
+	 * of this node's bookkeeping.
+	 */
+	releasedBlockLedger: ReleasedBlockLedger;
 	/**
 	 * Where the member keeps the record it promised on and the coordinator keeps the record it is
 	 * broadcasting — the state of an agreement in flight, which only matters across a restart. Built
@@ -1199,6 +1216,13 @@ function prepareServingStore(
 		pendLeaseMs: resolvePendLeaseMs(linkDeadlines.transactionTimeoutMs),
 	});
 
+	// Built after the repo because it reads `heldRevisions` through it: an entry carries the revision
+	// this node held when it released the block, which is what lets the sweep tell a block nobody has
+	// touched since from one a peer has pushed back (`ReleasedBlockEntry.releasedRev`).
+	const releasedBlockLedger = new ReleasedBlockLedger(kvStore, {
+		heldRevisions: blockIds => storageRepo.heldRevisions(blockIds)
+	});
+
 	const clusterProxy: ICluster = {
 		async update(record) {
 			if (!late.cluster) {
@@ -1216,7 +1240,7 @@ function prepareServingStore(
 
 	const onBlockHolders: BlockHoldersSink = (holders) => late.blockHolders?.(holders);
 
-	return { rawStorage, lease, storageRepo, underReplicationLedger, transactionStateStore, durabilityWindowFor, late, clusterProxy, repoProxy, onBlockHolders };
+	return { rawStorage, lease, storageRepo, underReplicationLedger, releasedBlockLedger, transactionStateStore, durabilityWindowFor, late, clusterProxy, repoProxy, onBlockHolders };
 }
 
 /**
@@ -1438,10 +1462,17 @@ export async function createLibp2pNodeBase(
 	// client it currently drives only the cache enforcement. If a per-minute walk ever shows up in a
 	// client's profile, give the client a longer `sampleIntervalMs` rather than removing the reading.
 	let blobCacheBudgetForPressure: BlobCacheBudget | undefined;
+	// The released-block sweep, reached through a `let` for the same reason the cache budget is: it is
+	// built after the node has started (it asks the blob service's piece sweep), while this reading is
+	// built before `createLibp2p`. A sample that lands before it exists asks nothing — the sweep runs
+	// once of its own as soon as it is built. Absent for the life of a client node, which holds no
+	// blocks for anyone and so releases none.
+	let releasedBlockSweepForPressure: ReleasedBlockSweep | undefined;
 	const storagePressure = new StoragePressure({
 		account: storageAccount,
 		thresholds: storagePressureThresholds,
-		requestCacheEnforcement: () => blobCacheBudgetForPressure?.request()
+		requestCacheEnforcement: () => blobCacheBudgetForPressure?.request(),
+		requestReleasedBlockSweep: () => releasedBlockSweepForPressure?.request()
 	});
 	// Before anything starts, beside the durability line, and awaited so an operator reading the
 	// start-up log sees the allotment next to what the node's writes survive.
@@ -1972,6 +2003,50 @@ export async function createLibp2pNodeBase(
 		}
 		// Once, now: a budget lowered across a restart is applied to what the last run cached.
 		blobCacheBudget.request();
+		// Deleting what this node handed over (`packages/db-p2p/docs/storage.md` § Deleting a block). Built
+		// here rather than inside `wireServingRole` because it needs the blob service's piece sweep, built
+		// above; and OUTSIDE the arachnode gate that wires its two writers, because a node whose FRET
+		// service is absent this run must still finish the entries a previous run left in its ledger.
+		//
+		// Only on the serving role, unlike the account and the pressure reading beside it. The sweep's one
+		// write is a block delete, and a client has no `StorageRepo` — nothing reads its block store, and
+		// no writer can record an entry on it either, since both release paths live inside the serving
+		// role. A client's sweep would therefore be a second handle onto a store nothing else uses,
+		// deleting entries nothing can have written.
+		if (serving) {
+			const releasedBlockSweep = new ReleasedBlockSweep({
+				ledger: serving.releasedBlockLedger,
+				storage: serving.storageRepo,
+				// The EXISTING piece sweep, asked once per run that deleted anything: a deleted block's
+				// blob holds are released by the blob reclaim pass and the cohort reaction, and this is what
+				// then removes the pieces no remaining hold needs.
+				sweepBlobPieces: () => blobs.sweep(),
+				log: createLogger('storage:released', node.peerId.toString()),
+			});
+			releasedBlockSweepForPressure = releasedBlockSweep;
+			// The late binding the two release callbacks inside the arachnode gate ask through, so a shed
+			// range's bytes go promptly rather than at the next pressure sample.
+			serving.late.requestReleasedBlockSweep = () => releasedBlockSweep.request();
+			// Installed before the pressure reading's wrapper below, so that one runs FIRST and no sample
+			// asks a stopped sweep; and after the blob service's, so this one runs first and no run asks a
+			// stopped piece sweep.
+			{
+				const previousStop = node.stop.bind(node);
+				node.stop = async () => {
+					try {
+						await releasedBlockSweep.stop();
+					} finally {
+						await previousStop();
+					}
+				};
+			}
+			// Once, now: this is the run that finishes the deletes a crash interrupted, and the one that
+			// takes a release whose own sweep request was lost with the process.
+			releasedBlockSweep.request();
+			// Expose for tests/diagnostics (mirrors node.blobCacheBudget).
+			(node as any).releasedBlockLedger = serving.releasedBlockLedger;
+			(node as any).releasedBlockSweep = releasedBlockSweep;
+		}
 		// The pressure reading now has a cache to enforce, so its sampler can start. The first sample
 		// lands as soon as the event loop turns — never inside node construction — so a node that comes
 		// back already over its allotment reads `refusing` at once rather than a sample interval later.
@@ -2890,7 +2965,7 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 		fretSvc, nodePrivateKey, onCommitCertificate, membership, networkManager, storageAccount,
 		storagePressure, partitionDetector
 	} = ctx;
-	const { storageRepo, rawStorage, underReplicationLedger, transactionStateStore, durabilityWindowFor, onBlockHolders } = serving;
+	const { storageRepo, rawStorage, underReplicationLedger, releasedBlockLedger, transactionStateStore, durabilityWindowFor, onBlockHolders } = serving;
 	const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix, linkDeadlines);
 
 	// Fetch a block archive from one cohort peer over the sync protocol, bounded by the same
@@ -3346,16 +3421,28 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 			const fretAdapter = new ArachnodeFretAdapter(fret, node.peerId.toString());
 			arachnodeHandles = { fret, fretAdapter };
 
-			// Blocks whose shed range has been RELEASED (Phase C of a ring shift, or a confirmed
-			// rebalance release). This is the GC-eligibility signal the future storage sweep
-			// (`st-storage-sweep-archival-and-capacity-estimate`) must consult: a block's local bytes may
-			// be reclaimed ONLY once it appears here, so an unconfirmed / still-served range is never
-			// swept. Populated strictly after replication is confirmed. See
-			// docs/arachnode-ring-handoff.md § Part 2 (Local bytes vs. tracking).
-			// NOTE: no sweep consumes this set yet; it is the coordinated eligibility handoff the sweep
-			// ticket will read. Until then it grows unbounded — bound it when the sweep lands.
-			const gcEligible = new Set<string>();
-			(node as any).gcEligibleBlocks = gcEligible;
+			/**
+			 * Record a confirmed release in the durable ledger and ask the sweep to take the bytes. The
+			 * ONLY writer of that ledger, called from the two release paths below (Phase C of a ring
+			 * shift, and the confirmed rebalance release) and from nowhere else: a block's local bytes may
+			 * be deleted only once it appears there, so an unconfirmed or still-served range is never
+			 * swept. See docs/arachnode-ring-handoff.md § Part 2 (Local bytes vs. tracking).
+			 *
+			 * A failed ledger write is logged, not thrown: the release itself has already happened and is
+			 * correct, and the cost of losing the record is bytes this node keeps rather than a block the
+			 * cohort loses. The block is offered again by the next rebalance or shift that still finds it
+			 * outside this node's range.
+			 */
+			const recordReleased = async (blockIds: readonly string[], source: ReleaseSource): Promise<void> => {
+				try {
+					const entries = await releasedBlockLedger.record(blockIds, source);
+					if (entries.length > 0) {
+						serving.late.requestReleasedBlockSweep?.();
+					}
+				} catch (err) {
+					log('release:unrecorded source=%s blocks=%d: %o', source, blockIds.length, err);
+				}
+			};
 
 			// The ring-shift state machine (advertise→confirm→release). Wired inside the rebalance block
 			// below (it needs the BlockTransferCoordinator confirmer + the cohort-size floor); left
@@ -3480,10 +3567,9 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 					// state stays un-advanced and the next check retries, the correct outcome for a reaction
 					// that threw.
 					rebalanceMonitor.onRebalance((event) => {
-						coordinator.handleRebalanceEvent(event).then((result) => {
+						coordinator.handleRebalanceEvent(event).then(async (result) => {
 							for (const blockId of result.released) {
 								rebalanceMonitor.untrackBlock(blockId); // also evicts from the shared ownedBlocks set
-								gcEligible.add(blockId);                 // confirmed replicated → safe to sweep
 							}
 							for (const [blockId, outcome] of result.growth) {
 								rebalanceMonitor.recordGrowthOutcome(blockId, outcome);
@@ -3495,6 +3581,11 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 									result.underReplicated.length, event.grown.size,
 									growthDiag.blocksAwaitingConfirmation, growthDiag.abandonedPairs);
 							}
+							// Confirmed replicated → the bytes may go. LAST, and the only await in this
+							// reaction: every monitor effect above was synchronous before the ledger existed and
+							// stays so, because deferring the growth feedback past a store write would let the
+							// re-check timer fire first and push a block again that was already confirmed.
+							await recordReleased(result.released, 'rebalance');
 						}).catch((err) => {
 							// NOTE: accepted tradeoff — recording nothing here means growthMaxAttempts (which
 							// only counts RECORDED incomplete outcomes) never bounds a reaction that throws
@@ -3523,11 +3614,11 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 						selfPeerId: peerId,
 						membership,
 						getFloor: () => rebalanceMonitor.getCohortSize(),
-						onRelease: (blockIds) => {
+						onRelease: async (blockIds) => {
 							for (const blockId of blockIds) {
 								rebalanceMonitor.untrackBlock(blockId);
-								gcEligible.add(blockId);
 							}
+							await recordReleased(blockIds, 'ring-shift');
 						}
 					});
 					// Reconcile any stale `moving` advertisement left by a crash mid-handoff (no-op unless

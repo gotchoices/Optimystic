@@ -411,6 +411,41 @@ export interface IHeldRevisionReader {
 	heldRevisions(blockIds: BlockId[]): Promise<Record<BlockId, ActionRev | null>>;
 }
 
+/** What {@link IReleasedBlockDeleter.deleteBlockIfNotAdvanced} did. */
+export type ReleasedBlockDeleteOutcome =
+	/** Everything this node held for the block is gone. */
+	| 'deleted'
+	/** The block has been written again since it was released, so it was kept. */
+	| 'advanced';
+
+/**
+ * The capability the released-block sweep deletes through — `ReleasedBlockSweep` in
+ * `packages/db-p2p/src/storage/released-block-sweep.ts`, which holds the ledger that says *which*
+ * blocks may be given to it. Named (rather than reached through the concrete repo) so the sweep is
+ * testable without a store, as the other capabilities above are.
+ */
+export interface IReleasedBlockDeleter {
+	/**
+	 * Remove everything this node holds for `blockId` ({@link IBlockStorage.deleteBlock}) unless its
+	 * committed `latest` has advanced past `pastRev` — the revision the node held when it released the
+	 * block.
+	 *
+	 * The read and the delete happen under ONE hold of the block's write latch, which is what makes
+	 * the condition meaningful: a push or a commit landing between a separate read and delete would be
+	 * taken anyway. `pastRev` is `undefined` for a block that held no committed revision at release,
+	 * and then any revision it holds now counts as advanced.
+	 *
+	 * A block that has advanced has been written again since this node stopped being responsible for
+	 * it — a replica pushed back by a peer, or a commit still routed here mid-transition. The node is
+	 * not responsible for it and the cohort holds it to the floor either way, so keeping the bytes is
+	 * harmless; deleting them would make the node delete a block it has just accepted.
+	 *
+	 * Durable before it resolves, so the sweep's ledger entry is dropped only after the delete it
+	 * records is on disk.
+	 */
+	deleteBlockIfNotAdvanced(blockId: BlockId, pastRev: number | undefined): Promise<ReleasedBlockDeleteOutcome>;
+}
+
 /**
  * The answer to a pend this node's check refused. A verdict that judges the transaction itself wrong
  * (`validity`) is the validity rejection a writer stops on, with this node's check as its one refusal —
@@ -425,7 +460,7 @@ function validationRefusal(validation: PendValidationResult): PendResult {
 		: new ValidityRejectedError({ refusals: [{ ...validation.validity, reason }] }).toFailure();
 }
 
-export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, IBlockReplicaStore, ICommitDigestPreviewer, ILocalApply, IDurableStorage, IRevisionActionReader, IPendingClaimReader, IHeldRevisionReader {
+export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, IBlockReplicaStore, ICommitDigestPreviewer, ILocalApply, IDurableStorage, IRevisionActionReader, IPendingClaimReader, IHeldRevisionReader, IReleasedBlockDeleter {
 	private readonly validatePend?: PendValidationHook;
 	private readonly unvalidatablePendPolicy: UnvalidatablePendPolicy;
 	/** Per-collection change listeners; empty sets are pruned on unsubscribe. */
@@ -1849,6 +1884,36 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		await this.endGroup(async () => {
 			await withBlockWriteLatch(blockId, latch => storage.recover(latch));
 		});
+	}
+
+	/**
+	 * See {@link IReleasedBlockDeleter}. The one write that takes bytes back off this node, and the
+	 * only caller of {@link IBlockStorage.deleteBlock}.
+	 *
+	 * The `latest` read and the delete share one hold of the block's write latch: that is what makes
+	 * the "has it been written again?" question answerable at all, since a commit or a push landing
+	 * between a separate read and delete would be taken anyway. `endGroup` flushes, so the delete is
+	 * durable before this resolves and the sweep's ledger entry is dropped only after that.
+	 *
+	 * No change notification, no owned-block-set edit: `packages/db-p2p/docs/storage.md` § Deleting a
+	 * block says why for both. A released block was untracked at Phase C, long before it was eligible.
+	 */
+	async deleteBlockIfNotAdvanced(blockId: BlockId, pastRev: number | undefined): Promise<ReleasedBlockDeleteOutcome> {
+		const storage = this.createBlockStorage(blockId);
+		// Set only on the delete path, so a block the condition kept — which wrote nothing — never flushes.
+		let wrote = false;
+		return await this.endGroup(() => withBlockWriteLatch(blockId, async (latch) => {
+			const latest = await storage.getLatest();
+			// `pastRev === undefined` is a block that held no committed revision when it was released, so
+			// holding one now is itself the advance.
+			if (latest !== undefined && (pastRev === undefined || latest.rev > pastRev)) {
+				log('deleteBlockIfNotAdvanced:advanced blockId=%s pastRev=%s latest=%d', blockId, pastRev ?? 'none', latest.rev);
+				return 'advanced';
+			}
+			wrote = true;
+			await storage.deleteBlock(latch);
+			return 'deleted';
+		}), () => wrote);
 	}
 
 	/**

@@ -37,10 +37,16 @@ export interface RingShiftDeps {
 	getFloor: () => number;
 	/**
 	 * Called with the shed block ids the instant Phase C releases them. The wiring stops serving +
-	 * spreading them (untrack) and marks their local bytes GC-eligible — nothing may reclaim a shed
-	 * range before this fires.
+	 * spreading them (untrack) and records them in the released-block ledger, which is the only thing
+	 * that makes their local bytes deletable — nothing may reclaim a shed range before this fires.
+	 *
+	 * **Awaited**, so a shift is not reported as settled until the release has been recorded as durably
+	 * as the wiring makes it. A rejection here does NOT roll the shift back: the range is already
+	 * released and other holders are already confirmed, so the correct outcome is a `moved-out` whose
+	 * bytes this node keeps until something offers the block again. The wiring logs that; this phase
+	 * does not swallow a rejection, so a caller still sees a failed `executeShift`.
 	 */
-	onRelease: (blockIds: string[]) => void;
+	onRelease: (blockIds: string[]) => void | Promise<void>;
 	/**
 	 * The node's network-membership gate (`createNetworkMembershipGate`). A candidate holder the gate
 	 * refuses is neither pushed a shed block nor counted toward the floor — counting one would release
@@ -172,7 +178,7 @@ export class RingShiftCoordinator {
 		// Phase C — release: active at the new ring (moveFrom cleared), stop serving/spreading + GC-eligible.
 		this.deps.fretAdapter.setArachnodeInfo(this.clearMove({ ...target, status: 'active' }));
 		if (shed.length > 0) {
-			this.deps.onRelease(shed);
+			await this.deps.onRelease(shed);
 		}
 		log('phaseC:release from=%d to=%d shed=%d', oldRing, newRingDepth, shed.length);
 		return { status: 'moved-out', from: oldRing, to: newRingDepth, released: shed };

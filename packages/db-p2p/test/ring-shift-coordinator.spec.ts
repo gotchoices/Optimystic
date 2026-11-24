@@ -1,9 +1,15 @@
 import { expect } from 'chai';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
+import type { ActionId } from '@optimystic/db-core';
 import { hashKey } from 'p2p-fret';
 import type { FretService } from 'p2p-fret';
-import { RingShiftCoordinator, type ReplicationConfirmer } from '../src/storage/ring-shift-coordinator.js';
+import { RingShiftCoordinator, type ReplicationConfirmer, type RingShiftDeps } from '../src/storage/ring-shift-coordinator.js';
+import { ReleasedBlockLedger } from '../src/storage/released-block-ledger.js';
+import { ReleasedBlockSweep } from '../src/storage/released-block-sweep.js';
+import type { ReleasedBlockDeleteOutcome } from '../src/storage/storage-repo.js';
+import { MemoryKVStore } from '../src/storage/memory-kv-store.js';
+import { createLogger } from '../src/logger.js';
 import { RingSelector } from '../src/storage/ring-selector.js';
 import { PartitionDetector } from '../src/cluster/partition-detector.js';
 import { extractPrefix, isServingHolder, qualifiesForFloor, partitionCovers } from '../src/storage/arachnode-partition.js';
@@ -99,6 +105,8 @@ describe('RingShiftCoordinator — advertise→confirm→release handoff', () =>
 	let selfBit0: number;
 	let shedBit0: number;
 	let shedBlock: string;
+	/** A second block in the same shed half, so a Phase B that fails for one of two has two to fail over. */
+	let shedBlock2: string;
 	let keptBlock: string;
 	let shedCoord: Uint8Array;
 
@@ -116,13 +124,15 @@ describe('RingShiftCoordinator — advertise→confirm→release handoff', () =>
 		selfBit0 = p!.prefixValue;
 		shedBit0 = 1 - selfBit0;
 
-		// Find one block the ring-1 partition sheds (coord bit0 == shedBit0) and one it keeps.
-		for (let i = 0; shedBlock === undefined || keptBlock === undefined; i++) {
+		// Find two blocks the ring-1 partition sheds (coord bit0 == shedBit0) and one it keeps.
+		for (let i = 0; shedBlock === undefined || shedBlock2 === undefined || keptBlock === undefined; i++) {
 			const id = `blk-${i}`;
 			const coord = await hashKey(encoder.encode(id));
 			const bit0 = extractPrefix(coord, 1);
-			if (bit0 === shedBit0 && shedBlock === undefined) { shedBlock = id; shedCoord = coord; }
-			else if (bit0 === selfBit0 && keptBlock === undefined) { keptBlock = id; }
+			if (bit0 === shedBit0) {
+				if (shedBlock === undefined) { shedBlock = id; shedCoord = coord; }
+				else if (shedBlock2 === undefined) { shedBlock2 = id; }
+			} else if (bit0 === selfBit0 && keptBlock === undefined) { keptBlock = id; }
 			if (i > 10_000) throw new Error('could not classify blocks'); // real hashes → both bits appear fast
 		}
 	});
@@ -136,7 +146,12 @@ describe('RingShiftCoordinator — advertise→confirm→release handoff', () =>
 		released = [];
 	});
 
-	function makeCoordinator(ownedBlocks: Set<string>, membership?: NetworkMembershipGate): RingShiftCoordinator {
+	function makeCoordinator(
+		ownedBlocks: Set<string>,
+		membership?: NetworkMembershipGate,
+		/** Overrides the default id collector for the one case that needs Phase C's real effect (the ledger write). */
+		onRelease?: RingShiftDeps['onRelease']
+	): RingShiftCoordinator {
 		return new RingShiftCoordinator({
 			fretAdapter: adapter as unknown as ArachnodeFretAdapter,
 			ringSelector,
@@ -146,7 +161,7 @@ describe('RingShiftCoordinator — advertise→confirm→release handoff', () =>
 			ownedBlocks,
 			selfPeerId: selfId,
 			getFloor: () => FLOOR,
-			onRelease: (ids) => released.push(...ids),
+			onRelease: onRelease ?? ((ids) => { released.push(...ids); }),
 			membership
 		});
 	}
@@ -203,6 +218,83 @@ describe('RingShiftCoordinator — advertise→confirm→release handoff', () =>
 			expect(outcome).to.deep.include({ status: 'moved-out' });
 			expect(released, 'only the shed block is released').to.deep.equal([shedBlock]);
 			expect(released, 'the kept block is NOT released').to.not.include(keptBlock);
+		});
+	});
+
+	describe('released-block eligibility (ticket a-node-deletes-what-it-released)', () => {
+		/**
+		 * The invariant the whole chain exists for: **a block's bytes are deleted only after a release
+		 * that confirmed at least the replication floor of other serving holders hold a current replica
+		 * of it.** It is pinned here, over the branching that decides it, because the only thing standing
+		 * between a shed block and `deleteBlock` is whether Phase B counted it — and the failure this
+		 * catches is the whole class of "the sweep worked out eligibility for itself", which would delete
+		 * from the mover's own *target* partition while the shift was still in flight.
+		 */
+		it('deletes only the blocks the confirm step counted — nothing after a rolled-back shift, both after a confirmed one', async () => {
+			const kv = new MemoryKVStore();
+			// Every block reads as holding revision 4, so an entry carries a real revision for the sweep's
+			// written-again check to compare against rather than the absent-metadata case.
+			const ledger = new ReleasedBlockLedger(kv, {
+				heldRevisions: async (blockIds) => Object.fromEntries(
+					blockIds.map(id => [id, { rev: 4, actionId: 'a4' as ActionId }])
+				)
+			});
+			const deletedBlocks: string[] = [];
+			const sweep = new ReleasedBlockSweep({
+				ledger,
+				// Stubbed storage: what this case decides is WHICH ids reach the delete, not what the delete
+				// does to a store — `raw-storage-conformance.ts` owns that half.
+				storage: {
+					async deleteBlockIfNotAdvanced(blockId: string, _pastRev: number | undefined): Promise<ReleasedBlockDeleteOutcome> {
+						deletedBlocks.push(blockId);
+						return 'deleted';
+					}
+				},
+				log: createLogger('storage:released')
+			});
+			const recordRelease: RingShiftDeps['onRelease'] = async (ids) => {
+				released.push(...ids);
+				await ledger.record(ids, 'ring-shift');
+			};
+
+			adapter.setSelf(active(0, undefined));
+			adapter.setPeer(peerA, active(1, { prefixBits: 1, prefixValue: shedBit0 }));
+			adapter.setPeer(peerB, active(1, { prefixBits: 1, prefixValue: shedBit0 }));
+			fret.setCohort([selfId, peerA, peerB]);
+			const owned = new Set([shedBlock, shedBlock2, keptBlock]);
+
+			// (a) A move-out whose Phase B cannot confirm one of the two shed blocks. Phase B is
+			// all-or-nothing, so the shift rolls back and the node keeps serving BOTH.
+			confirmer.behavior = 'fail';
+			const rolledBack = await makeCoordinator(owned, undefined, recordRelease)
+				.executeShift({ direction: 'out', newRingDepth: 1 });
+
+			expect(rolledBack.status, 'the shift rolled back').to.equal('rolled-back');
+			expect(await ledger.list(), 'a rolled-back shift records no eligibility').to.deep.equal([]);
+			const afterRollback = await sweep.sweep();
+			expect(afterRollback, 'nothing is deleted off a shift that confirmed nothing')
+				.to.deep.include({ found: 0, deleted: 0 });
+			expect(deletedBlocks, 'no block was given to the delete').to.deep.equal([]);
+
+			// (b) The same move-out, now confirming. Only the two shed blocks become eligible, and only
+			// they are deleted — the block the new partition still covers is never offered.
+			confirmer.behavior = 'byCount';
+			adapter.setSelf(active(0, undefined));
+			const movedOut = await makeCoordinator(owned, undefined, recordRelease)
+				.executeShift({ direction: 'out', newRingDepth: 1 });
+
+			expect(movedOut.status, 'the shift completed').to.equal('moved-out');
+			expect(new Set(released), 'Phase C released exactly the shed half').to.deep.equal(new Set([shedBlock, shedBlock2]));
+			const entries = await ledger.list();
+			expect(entries.map(entry => entry.source), 'each entry names the path that released it').to.deep.equal(['ring-shift', 'ring-shift']);
+			expect(entries.every(entry => entry.releasedRev === 4), 'each entry carries the revision held at release').to.equal(true);
+
+			const afterRelease = await sweep.sweep();
+			expect(afterRelease, 'both released blocks deleted, ledger left empty')
+				.to.deep.include({ found: 2, deleted: 2, kept: 0, failed: 0, remaining: 0 });
+			expect(new Set(deletedBlocks), 'only the confirmed shed blocks were deleted').to.deep.equal(new Set([shedBlock, shedBlock2]));
+			expect(deletedBlocks, 'the kept block was never given to the delete').to.not.include(keptBlock);
+			expect(await ledger.list(), 'an entry is dropped only after its delete').to.deep.equal([]);
 		});
 	});
 
