@@ -392,6 +392,14 @@ export class ClusterCoordinator {
 		private readonly cfg: ClusterConsensusConfig & { clusterSize: number },
 		private readonly localCluster?: {
 			update: (record: ClusterRecord) => Promise<ClusterRecord>;
+			/**
+			 * {@link update} for a record whose pend the program in THIS process wrote; see
+			 * ClusterMember.updateFromLocalWriter. Called by {@link prevoteLocalPromise} alone, and only
+			 * for a write marked `MessageOptions.localWriter` — the fact never rides on the record, so
+			 * nothing a remote writer sends can reach it. Optional like its siblings: absent on a bare
+			 * `ICluster` double, and the pre-vote then calls {@link update}, exactly as before.
+			 */
+			updateFromLocalWriter?: (record: ClusterRecord) => Promise<ClusterRecord>;
 			peerId: PeerId;
 			wasTransactionExecuted?: (messageHash: string) => boolean;
 			/** Local storage's verdict for a pend applied during consensus; see ClusterMember.getExecutedPendResult. */
@@ -913,7 +921,7 @@ export class ClusterCoordinator {
 	 * Initiates a 2-phase transaction for a specific block ID.
 	 * Returns the cluster record and whether the local cluster already executed the operations.
 	 */
-	async executeClusterTransaction(blockId: BlockId, message: RepoMessage, _options?: MessageOptions): Promise<{
+	async executeClusterTransaction(blockId: BlockId, message: RepoMessage, options?: MessageOptions): Promise<{
 		record: ClusterRecord;
 		localExecuted: boolean;
 		/**
@@ -1016,8 +1024,13 @@ export class ClusterCoordinator {
 			minRequiredSize: record.minRequiredSize
 		});
 
-		// Create a new pending transaction
-		const transactionPromise = this.executeTransaction(peers, record);
+		// Create a new pending transaction. `localWriter` is set only by a transactor in this process
+		// (`NetworkTransactor`) and never travels on the wire, so it is this node's one honest answer to
+		// "is this pend our own program's write" — which is what exempts it from the space gate on this
+		// node's own member, as it already does on a cohort of one. It is read here and threaded down to
+		// the pre-vote rather than put anywhere near the record: no field of `ClusterRecord` carries it.
+		const localWriter = options?.localWriter === true;
+		const transactionPromise = this.executeTransaction(peers, record, localWriter);
 		const pending = new Pending(transactionPromise);
 
 		// Store the transaction state
@@ -1099,7 +1112,7 @@ export class ClusterCoordinator {
 	/**
 	 * Executes the full transaction process
 	 */
-	private async executeTransaction(peers: ClusterPeers, record: ClusterRecord): Promise<ClusterRecord> {
+	private async executeTransaction(peers: ClusterPeers, record: ClusterRecord, localWriter: boolean): Promise<ClusterRecord> {
 		const peerCount = Object.keys(peers).length;
 
 		// Validate against minimum cluster size
@@ -1122,7 +1135,7 @@ export class ClusterCoordinator {
 		}
 
 		// Collect promises with super-majority requirement
-		const promised = await this.collectPromises(peers, record);
+		const promised = await this.collectPromises(peers, record, localWriter);
 		const superMajority = Math.ceil(peerCount * this.cfg.superMajorityThreshold);
 
 		// Count approvals, rejections and the three RETRYABLE refusals separately. A `conflict` vote is a
@@ -1426,7 +1439,7 @@ export class ClusterCoordinator {
 	 * round succeeds without a member's answer only from four members up: a cohort of two or three needs
 	 * every promise to proceed, though one that fails fast can still put the bar out of reach early.
 	 */
-	private async collectPromises(peers: ClusterPeers, record: ClusterRecord): Promise<{ record: ClusterRecord }> {
+	private async collectPromises(peers: ClusterPeers, record: ClusterRecord, localWriter: boolean): Promise<{ record: ClusterRecord }> {
 		const peerIds = Object.keys(peers);
 		const summary: ClusterLogPeerOutcome[] = [];
 		if (verbose) {
@@ -1442,7 +1455,7 @@ export class ClusterCoordinator {
 		// cluster on a throw"): a local throw is a real fault, and re-including self on that path would
 		// call it a second time.
 		const selfId = this.localCluster?.peerId.toString();
-		const prevote = await this.prevoteLocalPromise(record);
+		const prevote = await this.prevoteLocalPromise(record, localWriter);
 		if (prevote) summary.push(prevote);
 		const roundPeers = prevote ? peerIds.filter(id => id !== selfId) : peerIds;
 		// Each remote request gets `promiseImmediateRetries` in-line re-attempts before it counts as a
@@ -1523,7 +1536,7 @@ export class ClusterCoordinator {
 	 * either. The member reaches consensus and applies during the pre-vote, and the dropped
 	 * signature is re-collected by {@link presignLocalCommit}, as it was when self voted inside the round.
 	 */
-	private async prevoteLocalPromise(record: ClusterRecord): Promise<ClusterLogPeerOutcome | undefined> {
+	private async prevoteLocalPromise(record: ClusterRecord, localWriter: boolean): Promise<ClusterLogPeerOutcome | undefined> {
 		const selfId = this.localCluster?.peerId.toString();
 		if (selfId === undefined || !(selfId in record.peers)) {
 			return undefined;
@@ -1531,7 +1544,16 @@ export class ClusterCoordinator {
 		log('cluster-tx:promise-request', { messageHash: record.messageHash, peerId: selfId, isLocal: true, prevote: true });
 		try {
 			// A copy, so the member cannot mutate the record the fan-out is about to send.
-			const response = await this.localCluster!.update({ ...record });
+			//
+			// This call — an in-process one, to this node's own member — is the ONLY way the fact that
+			// the pend came from the program on this machine reaches a promise vote. It rides the call
+			// rather than the record for the reason the mark itself never travels: a remote writer must
+			// not be able to claim the host's own reserved headroom. A member built as a bare `ICluster`
+			// double has no such entry point and is asked exactly as before.
+			const member = this.localCluster!;
+			const response = localWriter && member.updateFromLocalWriter
+				? await member.updateFromLocalWriter({ ...record })
+				: await member.update({ ...record });
 			record.promises = { ...record.promises, ...response.promises };
 			log('cluster-tx:promise-response', {
 				messageHash: record.messageHash,

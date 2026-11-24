@@ -57,6 +57,10 @@ export function atLeastPressure(stage: StoragePressureStage, atLeast: StoragePre
  * and blobs it holds on the network's behalf are the giveable part. The gap between `refuseAbove` and
  * the allotment is the headroom this uses — the same headroom that covers pends already approved and
  * the sampling window.
+ *
+ * This is the limit `LocalBlobService.put` and `.pin` refuse at. The BLOCK pend doors read
+ * {@link refusesPendForSpace} instead, which exempts the host's own write without measuring it
+ * against anything — see that predicate's own `NOTE:` for what that does and does not cover.
  */
 export type OwnWriteRoom =
 	| { readonly hasRoom: true }
@@ -79,6 +83,32 @@ export function ownWriteRoomOf(capacity: StorageCapacity): OwnWriteRoom {
 		return { hasRoom: true };
 	}
 	return { hasRoom: false, usedBytes, totalBytes };
+}
+
+// NOTE: a block pend has no allotment backstop. Unlike `LocalBlobService.put` / `.pin`, which refuse
+// the host's own write at the effective total (`NodeOutOfSpaceError`), the two pend gates exempt it
+// outright — past the allotment the writer of a block pend is answered only by the store's own write
+// failure. Deliberate and pre-existing: a cohort has no peer a member can shed block history to, and
+// a cohort of one has no peer at all. If a deployment is ever seen filling its disk past its
+// allotment through its OWN block writes, give this predicate an `OwnWriteRoom` backstop too.
+/**
+ * Whether this node refuses a pend for want of space. The ONE predicate both pend gates read — the
+ * cohort member's promise vote (`ClusterMember.validatePendOperations`) and the cohort-of-one refusal
+ * (`CoordinatorRepo.refuseSoloPendForSpace`) — so the two cannot drift about whose write the reserved
+ * headroom is for. They did drift: the solo gate honoured the own-write exemption and the member's
+ * vote could not read it at all, so the same write was accepted when this node was the whole cohort
+ * and refused when it was one of three.
+ *
+ * A pend the program in THIS process wrote (`ownWrite`) is never refused here — see
+ * {@link OwnWriteRoom} for why the host's own writes are the last thing a node gives up, and the
+ * `NOTE:` above for the backstop block pends do NOT get. Everybody else's pend is refused once the
+ * last pressure sample read `refusing`.
+ *
+ * An absent gate — a member or repo built by hand, a node with no account — refuses nothing, which is
+ * also what a node that cannot measure its storage answers.
+ */
+export function refusesPendForSpace(gate: StoragePressureGate | undefined, ownWrite: boolean): boolean {
+	return !ownWrite && gate?.refusingNewData() === true;
 }
 
 /**

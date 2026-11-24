@@ -19,7 +19,7 @@ import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "./i-transaction-state-store.js";
 import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDigestPreviewer, type ILocalApply, type IDurableStorage, type IRevisionActionReader, type IPendingClaimReader, type IHeldRevisionReader } from "../storage/storage-repo.js";
 import { recordDurabilityWindowMs, type DurabilityWindowFor } from "../storage/durability-window.js";
-import type { StoragePressureGate } from "../storage/storage-pressure.js";
+import { refusesPendForSpace, type StoragePressureGate } from "../storage/storage-pressure.js";
 import type { BlockArchive } from "../storage/struct.js";
 import { isReservationAgainst, isAbandonedClaim, hasLapsed, claimAgeMs, reservationRequestFor, cohortCanMissAPend, type PendingClaim, type ReservationRequest } from "../storage/pending-claim.js";
 import { StuckReservationTracker } from "../repo/stuck-reservation.js";
@@ -216,6 +216,18 @@ function voteFor(verdict: PromiseVerdict): ClusterVote {
 function signedValidity({ computedHash }: ValidityRejection): ValidityRejection {
 	return computedHash === undefined ? {} : { computedHash };
 }
+
+/**
+ * Where the program that wrote the record a member is voting on runs. Named rather than a bare
+ * boolean because every signature it threads through reads better for saying what the value MEANS,
+ * and because the default is the one that refuses: a record off the wire is always `'elsewhere'`.
+ *
+ * `'this-process'` reaches a member by ONE path — {@link ClusterMember.updateFromLocalWriter}, which
+ * only this node's own coordinator calls in process — and is what exempts the host's own write from
+ * the space gate (`refusesPendForSpace`). It is never part of a {@link ClusterRecord}: not signed,
+ * not hashed, not sent, so no remote writer can claim it.
+ */
+type RecordWriter = 'this-process' | 'elsewhere';
 
 /** The log line naming each refusal kind; an operator reads them as four different events. */
 const refusalLogTag: Record<Extract<PromiseVerdict, { valid: false }>['kind'], string> = {
@@ -834,9 +846,41 @@ export class ClusterMember implements ICluster {
 
 	/**
 	 * Handles an incoming cluster update, managing the two-phase commit process
-	 * and coordinating with the local storage repo
+	 * and coordinating with the local storage repo.
+	 *
+	 * This is the method the wire handler calls (`ClusterService`), so it takes the record and NOTHING
+	 * else: every record arriving here is judged as a write from elsewhere. The one in-process caller
+	 * that knows better has its own entry point, {@link updateFromLocalWriter} — deliberately a
+	 * separate method rather than an optional second parameter here, which the wire handler would be
+	 * one forwarded argument away from filling in from a record it was handed.
 	 */
 	async update(record: ClusterRecord): Promise<ClusterRecord> {
+		return await this.updateFrom(record, 'elsewhere');
+	}
+
+	/**
+	 * {@link update} for a record whose pend the program in THIS process wrote: the in-process pre-vote
+	 * this node's own coordinator runs before a record fans out
+	 * (`ClusterCoordinator.prevoteLocalPromise`). The only difference in the vote is the space gate —
+	 * the host's own write is exempt there, as it is on the cohort of one
+	 * (`refusesPendForSpace`); every other refusal is judged identically, in the same order.
+	 *
+	 * NOT reachable from the wire, and that is the whole shape: `ICluster.update` takes one argument,
+	 * this method is not on `ICluster` at all, and the fact it carries is in no field of the record, so
+	 * the bytes a remote member receives are byte-identical to before and a remote writer has nothing
+	 * to forge.
+	 *
+	 * The pre-vote is the FIRST delivery of every record this node coordinates, and a member votes only
+	 * on a record that is not yet decided and carries no vote of its own
+	 * ({@link getTransactionPhase}) — so every later delivery of such a record here (the commit round,
+	 * the consensus broadcast, a carried owed record) already carries this member's vote or is already
+	 * decided, and never re-votes without the fact.
+	 */
+	async updateFromLocalWriter(record: ClusterRecord): Promise<ClusterRecord> {
+		return await this.updateFrom(record, 'this-process');
+	}
+
+	private async updateFrom(record: ClusterRecord, writer: RecordWriter): Promise<ClusterRecord> {
 		// Serialize concurrent updates for the same transaction
 		const existingUpdate = this.pendingUpdates.get(record.messageHash);
 		if (existingUpdate) {
@@ -847,7 +891,7 @@ export class ClusterMember implements ICluster {
 		}
 
 		// Create a promise for this update operation
-		const updatePromise = this.processUpdate(record);
+		const updatePromise = this.processUpdate(record, writer);
 		this.pendingUpdates.set(record.messageHash, updatePromise);
 
 		try {
@@ -861,7 +905,7 @@ export class ClusterMember implements ICluster {
 		}
 	}
 
-	private async processUpdate(record: ClusterRecord): Promise<ClusterRecord> {
+	private async processUpdate(record: ClusterRecord, writer: RecordWriter): Promise<ClusterRecord> {
 		const ourId = this.peerId.toString();
 		const inboundPhase = record.commits[ourId] ? 'commit' : record.promises[ourId] ? 'promise' : 'initial';
 		log('cluster-member:incoming', {
@@ -958,7 +1002,7 @@ export class ClusterMember implements ICluster {
 					log('cluster-member:action-promise', {
 						messageHash: record.messageHash
 					});
-					currentRecord = await this.handlePromiseNeeded(currentRecord);
+					currentRecord = await this.handlePromiseNeeded(currentRecord, writer);
 					log('cluster-member:action-promise-complete', {
 						messageHash: record.messageHash,
 						promises: Object.keys(currentRecord.promises ?? {})
@@ -1546,12 +1590,12 @@ export class ClusterMember implements ICluster {
 		return count > total / 2;
 	}
 
-	private async handlePromiseNeeded(record: ClusterRecord): Promise<ClusterRecord> {
+	private async handlePromiseNeeded(record: ClusterRecord, writer: RecordWriter): Promise<ClusterRecord> {
 		// Membership admission gate runs BEFORE pend validation: a member independently checks the declared
 		// peer set is a legitimate cluster it belongs to, and refuses (reject vote) rather than rubber-stamping
 		// a set the coordinator chose (e.g. a self-shrunk minority-partition set). On admission failure we skip
 		// pend validation entirely and emit the membership rejection.
-		const verdict = await this.evaluatePromise(record);
+		const verdict = await this.evaluatePromise(record, writer);
 
 		if (!verdict.valid) {
 			// One tag per refusal kind: a write judged invalid, a write queued behind a live reservation,
@@ -1615,7 +1659,7 @@ export class ClusterMember implements ICluster {
 	 * Expiry is judged before all of them: a record this member's clock says has expired is dead
 	 * whatever its membership or operations, and judging that needs no cohort derivation or storage read.
 	 */
-	private async evaluatePromise(record: ClusterRecord): Promise<PromiseVerdict> {
+	private async evaluatePromise(record: ClusterRecord, writer: RecordWriter): Promise<PromiseVerdict> {
 		const expiry = expiryOf(record);
 		if (expiry) {
 			return expiredVerdict(expiry);
@@ -1624,7 +1668,7 @@ export class ClusterMember implements ICluster {
 		if (!admission.admit) {
 			return invalidVerdict(admission.reason ?? MEMBERSHIP_NOT_ADMITTED);
 		}
-		const pendValidation = await this.validatePendOperations(record);
+		const pendValidation = await this.validatePendOperations(record, writer);
 		if (!pendValidation.valid) {
 			return pendValidation;
 		}
@@ -1971,7 +2015,7 @@ export class ClusterMember implements ICluster {
 	 * content failure and vetoed, while the same member holding no metadata for the block approved; and
 	 * a block with no committed revision listed none of the records reserving it.
 	 */
-	private async validatePendOperations(record: ClusterRecord): Promise<PromiseVerdict> {
+	private async validatePendOperations(record: ClusterRecord, writer: RecordWriter): Promise<PromiseVerdict> {
 		// Whether this record asked this member to STORE anything. Only a pend does, so only a pend can
 		// draw the out-of-space refusal below — a commit record's own vote is never about space (see
 		// {@link Signature}'s `out-of-space`).
@@ -2105,7 +2149,14 @@ export class ClusterMember implements ICluster {
 		// Reads the last pressure SAMPLE, never a scan: this runs on the inbound path of a consensus
 		// round, and a directory walk here would cost the member its vote to a timeout. A node that
 		// cannot measure its storage, or has taken no sample yet, answers `false` and refuses nothing.
-		if (sawPend && this.storagePressure?.refusingNewData() === true) {
+		//
+		// Through `refusesPendForSpace` rather than reading the gate directly, because that predicate is
+		// also what the cohort-of-one refusal reads (`CoordinatorRepo.refuseSoloPendForSpace`) and the
+		// two must not drift about whose write the reserved headroom is for — which they did, until a
+		// write this node's own program made was accepted when this node was the whole cohort and
+		// refused when it was one of three. A pend the program in THIS process wrote is exempt; a pend
+		// from any other writer still meets the gate at `refuseAbove`, here and on every other member.
+		if (sawPend && refusesPendForSpace(this.storagePressure, writer === 'this-process')) {
 			return {
 				valid: false,
 				kind: 'out-of-space',

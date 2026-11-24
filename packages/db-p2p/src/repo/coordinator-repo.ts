@@ -1,7 +1,7 @@
 import type { ConnectedCohort, WriteDurability, PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, CommitSuccess, GetBlockResults, PendResult, StaleFailure, WriteFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending, OutOfSpaceFailure, ShortfallFailure, SoloRefusalReason, Lane } from "@optimystic/db-core";
 import { LruMap, transformForBlockId, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability, CohortOutOfSpaceError, PromiseShortfallError, TransactionExpiredError, ValidityRejectedError, assertTransactionFits, laneField } from "@optimystic/db-core";
 import { BlocksHeldError, ClusterCoordinator, ConflictRaceLostError, DEFAULT_PEND_DELIVERY_DEFERRAL_MS, ValidatorRejectionError, type CohortResolution } from "./cluster-coordinator.js";
-import type { StoragePressureGate } from "../storage/storage-pressure.js";
+import { refusesPendForSpace, type StoragePressureGate } from "../storage/storage-pressure.js";
 import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
 import type { FretService } from "p2p-fret";
@@ -428,6 +428,11 @@ function consultVouches(answered: readonly string[], silent: readonly string[], 
  */
 interface LocalClusterWithExecutionTracking extends ICluster {
 	wasTransactionExecuted?(messageHash: string): boolean;
+	/** Promise-vote entry point for a pend the program in THIS process wrote, which the space gate
+	 *  exempts; see ClusterMember.updateFromLocalWriter. Optional like its siblings: absent on a bare
+	 *  ICluster double, and the coordinator's pre-vote then calls `update`, exactly as before. Reached
+	 *  only through that in-process pre-vote — it is not on `ICluster`, so no wire handler can call it. */
+	updateFromLocalWriter?(record: ClusterRecord): Promise<ClusterRecord>;
 	/** Local storage's verdict for a pend applied during consensus; see ClusterMember.getExecutedPendResult. */
 	getExecutedPendResult?(messageHash: string): PendResult | undefined;
 	/** Local storage's verdict for a commit applied during consensus; see ClusterMember.getExecutedCommitResult. */
@@ -893,6 +898,7 @@ export class CoordinatorRepo implements IRepo {
 		const localClusterRef = localCluster && localPeerId ? {
 			update: localCluster.update.bind(localCluster),
 			peerId: localPeerId,
+			updateFromLocalWriter: localCluster.updateFromLocalWriter?.bind(localCluster),
 			wasTransactionExecuted: localCluster.wasTransactionExecuted?.bind(localCluster),
 			getExecutedPendResult: localCluster.getExecutedPendResult?.bind(localCluster),
 			getExecutedCommitResult: localCluster.getExecutedCommitResult?.bind(localCluster),
@@ -3250,9 +3256,14 @@ export class CoordinatorRepo implements IRepo {
 	 * here would stop its application writing at `refuseAbove` with no path back but the operator
 	 * raising the allotment. `localWriter` is set only by a transactor in this process and is never
 	 * carried on the wire, so a remote writer cannot claim the exemption.
+	 *
+	 * The exemption itself is `refusesPendForSpace` (`../storage/storage-pressure.ts`), the one
+	 * predicate this gate and the cohort member's promise vote both read, so the two cannot drift about
+	 * whose write the reserved headroom is for. This gate's behaviour is unchanged by that sharing — it
+	 * is re-expressed through the predicate, not re-decided.
 	 */
 	private refuseSoloPendForSpace(batch: PendBatch, blockId: BlockId, options?: MessageOptions): OutOfSpaceFailure | undefined {
-		if (options?.localWriter === true || this.storagePressure?.refusingNewData() !== true) return undefined;
+		if (!refusesPendForSpace(this.storagePressure, options?.localWriter === true)) return undefined;
 		const selfId = this.localPeerId?.toString();
 		this.log('pend:solo-out-of-space', { actionId: batch.actionId, blockId });
 		return new CohortOutOfSpaceError({

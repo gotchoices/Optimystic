@@ -1,5 +1,6 @@
 /**
- * Ticket: a-full-cohort-member-refuses-a-pend.
+ * Tickets: a-full-cohort-member-refuses-a-pend, then
+ * bug-a-nodes-own-block-write-is-refused-by-its-own-cohort-vote for the last two claims.
  *
  * A cohort member whose storage has filled the space its operator gave it now answers a pend with a
  * signed `out-of-space` vote instead of approving and discovering the problem when its disk fails the
@@ -17,13 +18,17 @@
  *  - the member's own recomputed phase is the terminal-but-retryable one, not `Rejected`;
  *  - the writer's answer is the typed out-of-space refusal — RETURNED, not thrown — and neither a
  *    validator rejection nor a conflict-shaped `StaleFailure` the retry loop would absorb;
- *  - a cohort of ONE, which casts no vote, answers the same refusal from the coordinating repo — and
- *    exempts a write from the program on its own machine, whose limit is the allotment instead.
+ *  - a cohort of ONE, which casts no vote, answers the same refusal from the coordinating repo;
+ *  - and a write from the program on THIS machine is exempt at BOTH pend gates — the cohort of one,
+ *    and this node's own cohort member, which learns whose write it is from the in-process pre-vote
+ *    and never from the wire. One predicate answers for both (`refusesPendForSpace`), because the two
+ *    disagreeing is exactly the defect: the same write was taken when this node was the whole cohort
+ *    and refused when it was one of three.
  */
 
 import { expect } from 'chai';
 import { localDurability, isConflictFailure, isOutOfSpaceFailure, clusterVoteVerificationPayload } from '@optimystic/db-core';
-import { clusterMember } from '../src/cluster/cluster-repo.js';
+import { clusterMember, type ClusterMember } from '../src/cluster/cluster-repo.js';
 import { CoordinatorRepo, coordinatorRepo } from '../src/repo/coordinator-repo.js';
 import { captureLog } from './support/capture-log.js';
 import type {
@@ -348,5 +353,92 @@ describe('CoordinatorRepo — a solo node with no room refuses a pend, except on
 
 		expect(result.success, 'its own writes are the work this node exists to do').to.equal(true);
 		expect(storage.pendCalls).to.equal(1);
+	});
+});
+
+// ─── Own-write tier (the one gate the exemption could not reach: this node's own cohort member.
+// Driven at the WRITER tier deliberately — a member-tier test would pass on the new entry point while
+// the plumbing that reaches it from `pend` stayed wrong, which is the whole of the defect) ───
+
+/**
+ * A `CoordinatorRepo` whose cohort for the block is this node plus two peers that approve, with this
+ * node's REAL `ClusterMember` wired as its local member at the same pressure. That is the wiring a
+ * three-node deployment has, where every cohort contains every node — and where one node crossing
+ * `refuseAbove` used to stop every write to its slice, its own application's included.
+ */
+const cohortWithLocalMember = async (storage: IRepo, refusing: boolean): Promise<{
+	repo: CoordinatorRepo; member: ClusterMember; self: PeerId;
+}> => {
+	const self = await makeKeyPair();
+	const others = await Promise.all([makeKeyPair(), makeKeyPair()]);
+	const clusterPeers = makeClusterPeers([self.peerId, ...others.map(o => o.peerId)]);
+	const keyNetwork: IKeyNetwork = {
+		async findCoordinator() { return self.peerId; },
+		async findCluster() { return { ...clusterPeers }; }
+	};
+	const mocks = new Map(others.map(({ peerId }) => [peerId.toString(), new AnsweringClusterClient(peerId.toString(), 'approve')]));
+	const member = clusterMember({
+		storageRepo: storage,
+		peerNetwork: new MockPeerNetwork(),
+		peerId: self.peerId,
+		privateKey: self.privateKey,
+		storagePressure: pressure(refusing)
+	});
+	const repo = coordinatorRepo(keyNetwork, (peerId: PeerId) => {
+		const mock = mocks.get(peerId.toString());
+		if (!mock) throw new Error(`No mock for ${peerId.toString()}`);
+		return mock;
+	}, cfg)({
+		storageRepo: storage,
+		localPeerId: self.peerId,
+		localCluster: member,
+		storagePressure: pressure(refusing)
+	});
+	return { repo, member, self: self.peerId };
+};
+
+describe('CoordinatorRepo — a node with no room still takes its OWN write through its own cohort member', function () {
+	this.timeout(10000);
+
+	it('accepts a pend from the program on this machine, though this node is a member of its cohort', async () => {
+		// The defect, inverted. This node's own member votes in process, before the record fans out,
+		// and used to cast `out-of-space` on it like any other: at the default threshold a cohort of
+		// three needs all three approvals, so that one vote refused the node's own application's write
+		// with `Cohort is out of space: 1/3 member(s) have no room left (2/3 approvals)` — naming
+		// itself. The headroom between `refuseAbove` and the allotment is reserved for exactly these
+		// writes, and nothing a full cohort can do frees block history a member is still responsible for.
+		const storage = new CountingStorageRepo();
+		const { repo, member } = await cohortWithLocalMember(storage, true);
+		try {
+			const result = await repo.pend(makePend(), { localWriter: true });
+
+			expect(result.success, 'its own writes are the work this node exists to do').to.equal(true);
+			// Reached local storage — through this node's member at consensus or through the
+			// coordinator's own fallback apply, whichever the round took; which of the two is not what
+			// this test is about.
+			expect(storage.pendCalls, 'and the write must actually land').to.be.greaterThan(0);
+		} finally {
+			member.dispose();
+		}
+	});
+
+	it('still refuses the same pend from any other writer, naming itself as the member with no room', async () => {
+		// So the exemption is a fact carried on the in-process pre-vote and nothing else — not a
+		// blanket disarm of the member-side gate. Identical wiring, no `localWriter` mark.
+		const storage = new CountingStorageRepo();
+		const { repo, member, self } = await cohortWithLocalMember(storage, true);
+		try {
+			const result = await repo.pend(makePend());
+
+			expect(result.success, 'a write from elsewhere still meets the gate at `refuseAbove`').to.equal(false);
+			const failure = result as WriteFailure;
+			expect(isOutOfSpaceFailure(failure), 'and gets the same typed terminal answer').to.equal(true);
+			expect(failure.outOfSpace?.peerIds, 'cast by this node, on its own vote').to.deep.equal([self.toString()]);
+			expect(failure.outOfSpace?.approvals, 'the two peers with room approved; the bar is all three').to.equal(2);
+			expect(failure.outOfSpace?.needed).to.equal(3);
+			expect(storage.pendCalls, 'a refused pend must not reach local storage').to.equal(0);
+		} finally {
+			member.dispose();
+		}
 	});
 });
