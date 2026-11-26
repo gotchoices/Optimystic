@@ -2026,7 +2026,7 @@ __metadata:
   dependencies:
     "@noble/curves": "npm:^2.0.1"
     "@noble/hashes": "npm:^2.0.1"
-    "@quereus/quereus": "npm:^5.6.1"
+    "@quereus/quereus": "npm:^5.7.1"
     "@types/chai": "npm:^5.2.3"
     "@types/mocha": "npm:^10.0.10"
     "@types/node": "npm:^25.2.0"
@@ -2039,7 +2039,7 @@ __metadata:
     typescript: "npm:^5.9.3"
     uint8arrays: "npm:^6.1.1"
   peerDependencies:
-    "@quereus/quereus": ^5.6.1
+    "@quereus/quereus": ^5.7.1
   languageName: unknown
   linkType: soft
 
@@ -2061,7 +2061,7 @@ __metadata:
     "@optimystic/db-core": "workspace:^"
     "@optimystic/db-p2p": "workspace:^"
     "@optimystic/db-p2p-storage-fs": "workspace:^"
-    "@quereus/quereus": "npm:^5.6.1"
+    "@quereus/quereus": "npm:^5.7.1"
     "@types/chai": "npm:^5.2.3"
     "@types/debug": "npm:^4.1.12"
     "@types/mocha": "npm:^10.0.10"
@@ -2077,7 +2077,7 @@ __metadata:
     typescript: "npm:^5.9.3"
     uint8arrays: "npm:^6.1.1"
   peerDependencies:
-    "@quereus/quereus": ^5.6.1
+    "@quereus/quereus": ^5.7.1
   languageName: unknown
   linkType: soft
 
@@ -2124,7 +2124,7 @@ __metadata:
     "@optimystic/db-p2p": "workspace:^"
     "@optimystic/db-p2p-storage-rn": "workspace:^"
     "@optimystic/quereus-plugin-optimystic": "workspace:^"
-    "@quereus/quereus": "npm:^5.6.1"
+    "@quereus/quereus": "npm:^5.7.1"
     "@react-native/babel-preset": "npm:0.83.10"
     "@react-native/metro-config": "npm:0.83.10"
     buffer: "npm:^6.0.3"
@@ -2165,7 +2165,7 @@ __metadata:
     "@optimystic/db-p2p-storage-fs": "workspace:^"
     "@optimystic/db-p2p-storage-rn": "workspace:^"
     "@optimystic/quereus-plugin-optimystic": "workspace:^"
-    "@quereus/quereus": "npm:^5.6.1"
+    "@quereus/quereus": "npm:^5.7.1"
     "@types/chai": "npm:^5.2.3"
     "@types/mocha": "npm:^10.0.10"
     "@types/node": "npm:^25.1.0"
