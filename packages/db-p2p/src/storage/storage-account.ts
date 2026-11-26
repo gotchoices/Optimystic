@@ -42,6 +42,8 @@ export interface StorageAllotmentOptions {
 	 * `0` disables caching, so every call scans (the opt-out tests use). The cached value may lag
 	 * reality by up to the TTL; that staleness is acceptable because the consumer (ring selection)
 	 * is EWMA-smoothed, dead-banded, and gated by a 10-minute dwell — see `docs/repository.md`.
+	 *
+	 * A non-finite or negative lifetime throws at construction ({@link assertUsedBytesCacheTtlMs}).
 	 */
 	usedBytesCacheTtlMs?: number;
 
@@ -101,6 +103,26 @@ export function effectiveTotalBytes(allotmentBytes?: number, locationBytes?: num
 	if (allotmentBytes === undefined) return locationBytes;
 	if (locationBytes === undefined) return allotmentBytes;
 	return Math.min(allotmentBytes, locationBytes);
+}
+
+/**
+ * The memo's lifetime, defaulted — throwing rather than clamping, the rule
+ * `assertStorageAllotmentBytes` follows. `0` is a value ("scan every time"); a non-finite or negative
+ * one is not, and is the easiest of these options to arrive at by accident, since a host assembling
+ * `NodeOptions.storageAllotment` from configuration reaches `NaN` through `Number(…)` of anything
+ * that is not a number. Both ends of it fail silently, which is why neither is clamped: `NaN`
+ * compares false against every expiry and so rescans the whole store on every ring tick and pressure
+ * sample, and `Infinity` memoizes the first scan for the life of the node, which then never notices
+ * its disk filling again — the un-measured storage this account exists to end.
+ */
+function assertUsedBytesCacheTtlMs(declared: number | undefined): number {
+	if (declared === undefined) {
+		return DEFAULT_USED_BYTES_CACHE_TTL_MS;
+	}
+	if (!Number.isFinite(declared) || declared < 0) {
+		throw new RangeError(`storageAllotment.usedBytesCacheTtlMs must be a finite number of milliseconds at or above 0, got ${declared}`);
+	}
+	return declared;
 }
 
 /** One scan's figures, memoized together so they can never come from different moments. */
@@ -254,7 +276,7 @@ export class StorageAccount {
 		this.uncountedPieces = blockStoreCountsPieces(storage.blocks, storage.pieces) ? undefined : storage.pieces;
 		this.blobRecords = options.blobRecords ?? ((): undefined => undefined);
 		this.allotmentBytes = options.bytes;
-		this.ttlMs = options.usedBytesCacheTtlMs ?? DEFAULT_USED_BYTES_CACHE_TTL_MS;
+		this.ttlMs = assertUsedBytesCacheTtlMs(options.usedBytesCacheTtlMs);
 		this.now = options.now ?? ((): number => Date.now());
 	}
 

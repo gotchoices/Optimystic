@@ -739,9 +739,10 @@ function quotedKeyList(keys: readonly string[]): string {
 /**
  * The plugin-level `storage_allotment` (the node's `storageAllotment` option — how many bytes of
  * this machine the operator gave the network), or `undefined` when unset. The SHAPE is checked here
- * and the NUMBERS are not: `bytes: 0`, a fractional `bytes` and inverted `thresholds` are the node's
- * `RangeError` at construction (`assertStorageAllotmentBytes`, `resolveStoragePressureThresholds`),
- * and restating those rules here would give an operator two voices to keep in step.
+ * and the NUMBERS are not: `bytes: 0`, a fractional `bytes`, inverted `thresholds` and a non-finite
+ * `usedBytesCacheTtlMs` are the node's `RangeError` at construction (`assertStorageAllotmentBytes`,
+ * `resolveStoragePressureThresholds`, `assertUsedBytesCacheTtlMs`), and restating those rules here
+ * would give an operator two voices to keep in step.
  *
  * An unknown key is refused rather than dropped, because a dropped key reaches the node as "no
  * allotment at all" — silently un-measured storage is exactly what this setting exists to end, so

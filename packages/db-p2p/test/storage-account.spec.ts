@@ -264,6 +264,18 @@ describe('StorageAccount', () => {
 			expect(calls()).to.equal(2);
 		});
 
+		// A `NaN` TTL rescans the whole store on every tick and an `Infinity` one keeps the first scan
+		// for the life of the node; both read as a working memo, so construction refuses them.
+		it('refuses a TTL that is not a lifetime, naming the option', () => {
+			const { storage } = spyStorage();
+			expect(() => makeAccount(storage, { usedBytesCacheTtlMs: Number.NaN }))
+				.to.throw(RangeError, /usedBytesCacheTtlMs/);
+			expect(() => makeAccount(storage, { usedBytesCacheTtlMs: Number.POSITIVE_INFINITY }))
+				.to.throw(RangeError, /usedBytesCacheTtlMs/);
+			expect(() => makeAccount(storage, { usedBytesCacheTtlMs: -1 }))
+				.to.throw(RangeError, /usedBytesCacheTtlMs/);
+		});
+
 		it('scans on every call when the TTL is 0 (caching disabled)', async () => {
 			const { storage, calls } = spyStorage();
 			const account = makeAccount(storage, { bytes: 1024, usedBytesCacheTtlMs: 0 });
