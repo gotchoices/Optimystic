@@ -699,6 +699,7 @@ export class CollectionFactory {
         bootstrapNodes: options.libp2pOptions?.bootstrapNodes ?? [],
         linkRoundTripMs: options.libp2pOptions?.linkRoundTripMs,
         cohortTopic: options.libp2pOptions?.cohortTopic,
+        storageAllotment: options.libp2pOptions?.storageAllotment,
         fretProfile: 'edge',
         clusterSize: 1,
         clusterPolicy: {

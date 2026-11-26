@@ -683,6 +683,7 @@ function resolveBinding(
       bootstrapNodes: [],
       linkRoundTripMs: declaredLinkRoundTripMs(aux),
       cohortTopic: declaredCohortTopic(aux),
+      storageAllotment: declaredStorageAllotment(aux),
     },
     storageFactory,
   };
@@ -712,6 +713,70 @@ function declaredCohortTopic(aux: Readonly<Record<string, unknown>>): LibP2PNode
     return declared as LibP2PNodeOptions['cohortTopic'];
   }
   throw new Error(`cohort_topic must be an object with a boolean 'enabled' (the node's cohortTopic option); got ${typeof declared} ${String(declared)}`);
+}
+
+type DeclaredStorageAllotment = NonNullable<LibP2PNodeOptions['storageAllotment']>;
+type DeclaredStorageThresholds = NonNullable<DeclaredStorageAllotment['thresholds']>;
+
+/**
+ * The keys a `storage_allotment` takes, and the keys its `thresholds` takes.
+ *
+ * NOTE: these ARE the accepted shape, so a key ADDED to the node's `storageAllotment` over in
+ * db-p2p is refused here until it is added to one of these lists — loud and stale, chosen over
+ * passing an unknown key through to a node that would ignore it. `satisfies` ties each list to the
+ * node's own keys, so a RENAME over there is a compile error here rather than a setting that
+ * silently stops arriving.
+ */
+const STORAGE_ALLOTMENT_KEYS = ['bytes', 'thresholds', 'usedBytesCacheTtlMs'] satisfies (keyof DeclaredStorageAllotment)[];
+const STORAGE_ALLOTMENT_THRESHOLD_KEYS = ['reclaimBelow', 'shedAbove', 'refuseAbove'] satisfies (keyof DeclaredStorageThresholds)[];
+
+/** `'a', 'b' and 'c'` — the accepted keys, as an error message lists them. */
+function quotedKeyList(keys: readonly string[]): string {
+  const quoted = keys.map(key => `'${key}'`);
+  return quoted.length <= 1 ? (quoted[0] ?? '') : `${quoted.slice(0, -1).join(', ')} and ${quoted[quoted.length - 1]}`;
+}
+
+/**
+ * The plugin-level `storage_allotment` (the node's `storageAllotment` option — how many bytes of
+ * this machine the operator gave the network), or `undefined` when unset. The SHAPE is checked here
+ * and the NUMBERS are not: `bytes: 0`, a fractional `bytes` and inverted `thresholds` are the node's
+ * `RangeError` at construction (`assertStorageAllotmentBytes`, `resolveStoragePressureThresholds`),
+ * and restating those rules here would give an operator two voices to keep in step.
+ *
+ * An unknown key is refused rather than dropped, because a dropped key reaches the node as "no
+ * allotment at all" — silently un-measured storage is exactly what this setting exists to end, so
+ * `{ gigabytes: 20 }` has to say so. `{}` is accepted and means what unset means.
+ */
+export function declaredStorageAllotment(aux: Readonly<Record<string, unknown>>): LibP2PNodeOptions['storageAllotment'] {
+  const declared = aux['storage_allotment'];
+  if (declared === undefined) return undefined;
+  if (typeof declared !== 'object' || declared === null || Array.isArray(declared)) {
+    throw new Error(`storage_allotment must be an object with an optional number 'bytes', an optional 'thresholds' and an optional number 'usedBytesCacheTtlMs' (the node's storageAllotment option); got ${typeof declared} ${String(declared)}`);
+  }
+  const fields = declared as Record<string, unknown>;
+  for (const key of Object.keys(fields)) {
+    if (!(STORAGE_ALLOTMENT_KEYS as readonly string[]).includes(key)) {
+      throw new Error(`storage_allotment has no '${key}' setting; it takes ${quotedKeyList(STORAGE_ALLOTMENT_KEYS)}`);
+    }
+  }
+  if (fields['bytes'] !== undefined && typeof fields['bytes'] !== 'number') {
+    throw new Error(`storage_allotment.bytes must be a number of bytes; got ${typeof fields['bytes']} ${String(fields['bytes'])}`);
+  }
+  if (fields['usedBytesCacheTtlMs'] !== undefined && typeof fields['usedBytesCacheTtlMs'] !== 'number') {
+    throw new Error(`storage_allotment.usedBytesCacheTtlMs must be a number of milliseconds; got ${typeof fields['usedBytesCacheTtlMs']} ${String(fields['usedBytesCacheTtlMs'])}`);
+  }
+  const thresholds = fields['thresholds'];
+  if (thresholds !== undefined) {
+    if (typeof thresholds !== 'object' || thresholds === null || Array.isArray(thresholds)) {
+      throw new Error(`storage_allotment.thresholds must be an object of fractions; it takes ${quotedKeyList(STORAGE_ALLOTMENT_THRESHOLD_KEYS)}; got ${typeof thresholds} ${String(thresholds)}`);
+    }
+    for (const key of Object.keys(thresholds)) {
+      if (!(STORAGE_ALLOTMENT_THRESHOLD_KEYS as readonly string[]).includes(key)) {
+        throw new Error(`storage_allotment.thresholds has no '${key}' setting; it takes ${quotedKeyList(STORAGE_ALLOTMENT_THRESHOLD_KEYS)}`);
+      }
+    }
+  }
+  return declared as DeclaredStorageAllotment;
 }
 
 /**

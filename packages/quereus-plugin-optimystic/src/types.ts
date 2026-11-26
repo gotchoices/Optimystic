@@ -82,6 +82,22 @@ export interface LibP2PNodeOptions {
    * {@link linkRoundTripMs}.
    */
   cohortTopic?: NodeOptions['cohortTopic'];
+
+  /**
+   * How many bytes of this machine the operator gave the network, and what the node does as it fills
+   * (`NodeOptions.storageAllotment` in `@optimystic/db-p2p`): `bytes`, plus the optional
+   * `thresholds` it changes behaviour at and `usedBytesCacheTtlMs`. Set through the plugin-level
+   * `storage_allotment` only, for the same reason as {@link linkRoundTripMs}. Unset, the node
+   * measures against whatever its storage backend reports free — and on a backend that reports none
+   * (SQLite, LevelDB, memory) it cannot tell how full it is at all.
+   *
+   * A `Pick` of the node's own option type rather than the whole of it, for two reasons. The two keys
+   * left out are wiring seams a host has no business setting: `now` is an injectable clock, and
+   * `blobRecords` is overwritten by the node itself when it builds the account. And naming the keys
+   * against the node's type makes a rename over in db-p2p a compile error here, rather than a
+   * setting that silently stops arriving.
+   */
+  storageAllotment?: Pick<NonNullable<NodeOptions['storageAllotment']>, 'bytes' | 'thresholds' | 'usedBytesCacheTtlMs'>;
 }
 
 /**
