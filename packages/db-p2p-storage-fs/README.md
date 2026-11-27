@@ -12,7 +12,9 @@ Node.js filesystem storage backend for Optimystic peers. Provides:
   transaction state used to recover crashed two-phase commits.
 - **`FilePieceStore`** — implements `IPieceStore` for the pieces large values
   ("blobs") are cut into: one file per piece, under `optimystic-pieces/`
-  (below).
+  (below), and the optional `IPieceStoreFiles` capability that cuts a file into
+  pieces and joins pieces back into a file without their bytes passing through
+  JavaScript (below).
 
 The first two write through one write-ahead log per directory (below); the
 piece store bypasses it.
@@ -179,11 +181,28 @@ lock and holds no handle between calls; two stores over one directory are not
 supported, since the second's open deletes the first's temps — which is what
 `fileNodeStorage`'s one-set-per-directory rule makes unreachable for a host.
 
+It also offers the optional file capability, which a node exposes as
+`node.blobs.paths` when its host asks for it
+([blobs.md §Putting and reading by file path](../../docs/blobs.md#putting-and-reading-by-file-path)).
+`importFile` reads the file one leaf at a time, names each leaf by the SHA-256 of
+its bytes (`node:crypto`, not the blob service's digest port) and stores it
+through the same put steps as above, so a leaf already stored costs nothing; it
+answers the leaves in file order. `exportFile` joins the pieces into
+`.<target name>.<hex>.tmp` beside the target and renames it over the target, so
+the target holds the whole result or is left exactly as it was — a missing piece
+rejects and removes the temp. That temp has to sit beside the target for the
+rename to be atomic, which makes it the one temp this store writes outside
+`incoming/`, and the one nothing later cleans up: a process killed mid-export
+leaves it next to the target for whoever owns that directory to remove.
+
 It reports the same store identity as a `FileRawStorage` and a `FileKVStore` over
 the same `basePath`, whose byte count already includes the piece directory, so the
 node's storage monitor does not count the pieces twice. Its log lines are on
 `optimystic:db-p2p-storage-fs:pieces:file` (`incoming:cleared`,
-`rename:raced`, `temp:close-failed`, `temp:unlink-failed`; see `docs/debugging.md`).
+`rename:raced`, `temp:close-failed`, `temp:unlink-failed`, and of the file
+capability `import:done`, `export:done`, `import:close-failed`,
+`export:piece-close-failed`, `export:close-failed`, `export:unlink-failed`; see
+`docs/debugging.md`).
 
 ## Write-ahead log
 
@@ -323,8 +342,11 @@ cleanup:
   listings over unflushed writes and the log it shares with `FileRawStorage`,
   and the under-replication ledger over `FileKVStore`.
 - **Piece store** — `runPieceStoreConformance('FilePieceStore', …)` from the same
-  subpath, with the flush-then-reopen case, plus `test/file-piece-store.spec.ts`
-  for a temp left in `incoming/` and the refusal of an id that is not a piece id.
+  subpath, with the flush-then-reopen case and the file-capability cases (the cut
+  an import makes at five file lengths, and what an export joins, replaces and
+  refuses), plus `test/file-piece-store.spec.ts` for a temp left in `incoming/`,
+  the refusal of an id that is not a piece id — by an export as well as a put —
+  and an export of a piece larger than the 256 KiB an export copies at a time.
 
 ## Known limitations
 

@@ -88,6 +88,9 @@ describe('FilePieceStore on disk', () => {
 
 		await assert.rejects(store.get('../x' as PieceId), RangeError);
 		await assert.rejects(store.put(upper, Uint8Array.of(1)), RangeError);
+		// An export's ids become paths before the store opens or its temp beside the target exists, so
+		// one readdir covers all three: a refused id leaves neither a piece directory nor a temp.
+		await assert.rejects(store.exportFile([upper], path.join(base, 'joined')), RangeError);
 		assert.deepStrictEqual(await fs.readdir(base), []);
 	});
 });

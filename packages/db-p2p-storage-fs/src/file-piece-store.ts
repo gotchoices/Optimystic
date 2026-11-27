@@ -111,7 +111,13 @@ async function readFully(handle: fs.FileHandle, buffer: Uint8Array): Promise<num
 	return filled;
 }
 
-/** As `writeAll` in file-write-log.ts; not shared because exporting it would widen this package's API. */
+/**
+ * As `writeAll` in file-write-log.ts, which keeps its own copy, as `store-lock.ts` and this file
+ * keep their own copies of the ENOENT-tolerant unlink: this package keeps these one-loop filesystem
+ * primitives per module rather than in a shared one. NOTE: if a fourth module needs one of them,
+ * move the set into an internal module here that `index.ts` does not re-export, rather than adding
+ * another copy.
+ */
 async function writeAll(handle: fs.FileHandle, bytes: Uint8Array): Promise<void> {
 	let written = 0;
 	while (written < bytes.byteLength) {
