@@ -515,6 +515,9 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobRespo
 	 */
 	private putFile(files: IPieceStoreFiles, mode: BlobPathAccess['mode'], path: string, options: BlobPutOptions = {}): Promise<BlobPutResult> {
 		return this.putPieces(options, async mine => {
+			// Before the import, not only after it: the store's call takes no signal, so an import once
+			// started runs to its end, and a caller that had already cancelled would wait out a whole file.
+			options.signal?.throwIfAborted();
 			const leaves = await this.importLeaves(files, path, mine);
 			options.signal?.throwIfAborted();
 			assertImportedLeaves(leaves, path);
@@ -640,6 +643,9 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobRespo
 	 * therefore joins into an empty file. A piece that is not here corrects the record to not whole,
 	 * as a read that finds one does.
 	 */
+	// NOTE: every id is held at once, because `exportFile` takes the whole list; about 60 bytes per
+	// 256 KiB of blob, so a gigabyte costs a quarter of a megabyte of strings. If a host ever exports
+	// blobs large enough for that to matter, `exportFile` has to take an iterable instead.
 	private async wholeBlobPieces(ref: BlobRef, signal: AbortSignal | undefined): Promise<PieceId[]> {
 		const source = this.readSource(async id => {
 			throw new BlobUnavailableError(ref, 'cohort-unreachable', id);
@@ -1335,7 +1341,7 @@ function withPin(holds: readonly BlobHold[], owner: string, at: number): readonl
 
 // NOTE: from here to `cacheOnly` is the module's record-shaping block — pure `BlobRecord` in,
 // `BlobRecord` out, none of it touching the class. It is what has grown with each hold the service
-// learned, and the file is 1548 lines with it (`wc -l`). If it grows again, move the block to its own
+// learned, and the file is 1559 lines with it (`wc -l`). If it grows again, move the block to its own
 // `blob-record-changes.ts`; splitting it is a rename, since every function in it is module-private.
 /** The owner's pin added unless it already pins it, the size set and the blob whole; every other hold and field kept. */
 function recordAfterPut(current: BlobRecord | undefined, { ref, size }: BlobPutResult, owner: string, at: number): BlobRecord {

@@ -87,6 +87,13 @@ export interface ImportedPiece {
  * export at the call. Every such store also passes the file cases of `runPieceStoreConformance`
  * (`packages/db-p2p/src/testing/piece-store-conformance.ts`), which pin the cut, the ids and the
  * atomicity below.
+ *
+ * NOTE: neither call takes an `AbortSignal`, so a put's or a read's abort is honoured only between
+ * the service's steps, never during the store's own work — tens of seconds for a large file on a
+ * phone. Left out because a native implementation has nothing to hand one to on most platforms, and
+ * widening the contract after two stores implement it is the expensive order; revisit if a host
+ * asks to cancel a running import, which is `signal?: AbortSignal` added to both calls and ignored
+ * by a store that cannot act on it.
  */
 export interface IPieceStoreFiles {
 	/**

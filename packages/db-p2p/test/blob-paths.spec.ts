@@ -1,15 +1,17 @@
 /**
  * Putting and reading a blob by file path (docs/blobs.md §Putting and reading by file path): that a
  * path put ends in the same reference a stream put of the same bytes gives, that `verify` refuses an
- * import the store named wrongly while `trust` accepts it, and that an import cut at another size is
- * refused whatever the mode.
+ * import the store named wrongly while `trust` accepts it, and that an import cut at another size or
+ * named with the wrong codec is refused whatever the mode.
  *
  * The stores below are real `IPieceStoreFiles` implementations over `node:fs` and `node:crypto`,
  * standing in for a host whose native code cuts, hashes and joins files — not doubles of anything
- * this repository owns. The two misbehaving ones subclass the honest one, each changing exactly the
- * one thing its case is about.
+ * this repository owns. The misbehaving ones subclass the honest one, each changing exactly the one
+ * thing its case is about.
  */
 import { expect } from 'chai';
+import { CID } from 'multiformats/cid';
+import * as Digest from 'multiformats/hashes/digest';
 import { createHash } from 'node:crypto';
 import { mkdtemp, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -18,7 +20,10 @@ import {
 	BLOB_PIECE_BYTES,
 	BlobImportError,
 	buildBlob,
+	DAG_PB_CODEC,
+	pieceIdOfCid,
 	rawPieceIdOfDigest,
+	SHA2_256_CODE,
 	type BlobPutResult,
 	type PieceId,
 } from '@optimystic/db-core';
@@ -102,6 +107,14 @@ class WrongIdPieceStore extends FilePathPieceStore {
 	}
 }
 
+/** A store that names a leaf with the list-piece codec: a well-formed piece id, but not a raw leaf's. */
+class ListCodecLeafPieceStore extends FilePathPieceStore {
+	protected override nameLeaf(leaf: Uint8Array): PieceId {
+		const digest = createHash('sha256').update(leaf).digest();
+		return pieceIdOfCid(CID.createV1(DAG_PB_CODEC, Digest.create(SHA2_256_CODE, digest)));
+	}
+}
+
 /** A store that cuts a short leaf in the middle: it disagrees with the builder about where leaves end. */
 class ShortMiddleLeafPieceStore extends FilePathPieceStore {
 	protected override *cut(bytes: Uint8Array, pieceSize: number): Generator<Uint8Array> {
@@ -180,6 +193,13 @@ function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
 const SIZES: readonly number[] = [0, BLOB_PIECE_BYTES, 175 * BLOB_PIECE_BYTES + 1];
 const MODES: readonly ('verify' | 'trust')[] = ['verify', 'trust'];
 
+/**
+ * The largest size runs under `verify` alone. What it pins is the tree over more leaves than one
+ * list piece holds, which the mode has no bearing on, and it is the only case in this package that
+ * writes tens of megabytes to disk; `trust` is pinned at the other two sizes.
+ */
+const sizesFor = (mode: 'verify' | 'trust'): readonly number[] => mode === 'trust' ? SIZES.slice(0, -1) : SIZES;
+
 describe('blob paths', () => {
 	let directory: string;
 	let next = 0;
@@ -207,7 +227,7 @@ describe('blob paths', () => {
 	});
 
 	for (const mode of MODES) {
-		for (const size of SIZES) {
+		for (const size of sizesFor(mode)) {
 			it(`puts ${size} bytes from a file under ${mode} as a stream put would, and reads them back`, async () => {
 				const bytes = contentOf(size);
 				const expected = await streamedPut(bytes);
@@ -249,6 +269,17 @@ describe('blob paths', () => {
 		// The cost the mode buys: nothing here checked the store's hash, so a wrong id becomes a
 		// reference that names bytes no other machine would agree these are.
 		expect(put.ref, 'the reference').to.not.equal((await streamedPut(bytes)).ref);
+	});
+
+	it('refuses an import whose leaf is named with the list-piece codec', async () => {
+		const bytes = contentOf(1000);
+		const service = serviceOver(new ListCodecLeafPieceStore(), 'verify');
+
+		const refused = await service.paths!.putFile(await fileOf(bytes)).then(() => undefined, (error: unknown) => error);
+
+		// `parsePieceId` accepts a list piece's id too, so the codec is checked on its own; without that
+		// check an import could name a leaf with an id the tree would read as a list piece.
+		expect(refused).to.be.instanceOf(BlobImportError).with.property('reason', 'not-a-raw-piece');
 	});
 
 	for (const mode of MODES) {

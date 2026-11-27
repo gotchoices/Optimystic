@@ -234,6 +234,20 @@ export function runPieceStoreConformance(
 const FILE_LENGTHS: readonly number[] = [0, 1000, BLOB_PIECE_BYTES, BLOB_PIECE_BYTES + 1, 3 * BLOB_PIECE_BYTES + 5];
 
 /**
+ * `length` bytes whose every leaf is a piece of its own. `pieceBytes` repeats with period 256,
+ * which divides the piece size, so every FULL leaf of one of its buffers has the same bytes and so
+ * one id — and over such a file a store that reported or joined its leaves in any order would pass
+ * these cases. One byte per leaf carrying the leaf's number is enough to separate them.
+ */
+function fileBytes(length: number, seed: number): Uint8Array {
+	const bytes = pieceBytes(length, seed);
+	for (let offset = 0; offset < length; offset += BLOB_PIECE_BYTES) {
+		bytes[offset] = (bytes[offset]! + (offset / BLOB_PIECE_BYTES) + 1) & 0xff;
+	}
+	return bytes;
+}
+
+/**
  * The cases for a store that offers {@link IPieceStoreFiles} (docs/blobs.md §Putting and reading by
  * file path). Registered for every backend and skipped for a store that does not offer it, since
  * whether it does is known only once one has been made; a store that DOES offer it and whose harness
@@ -261,7 +275,7 @@ function registerFileCases(name: string, current: () => PieceStoreHarness): void
 
 		for (const length of FILE_LENGTHS) {
 			it(`imports ${length} bytes as the leaves a stream put would store`, async () => {
-				const bytes = pieceBytes(length, 21);
+				const bytes = fileBytes(length, 21);
 				const imported = await store.importFile(await files.write(bytes), BLOB_PIECE_BYTES);
 				const slices = leafSlices(bytes);
 				expect(reported(imported), 'the ids and sizes').to.deep.equal(await expectedLeaves(slices));
@@ -272,7 +286,7 @@ function registerFileCases(name: string, current: () => PieceStoreHarness): void
 		}
 
 		it('importing one file twice stores each piece once', async () => {
-			const path = await files.write(pieceBytes(BLOB_PIECE_BYTES + 100, 22));
+			const path = await files.write(fileBytes(BLOB_PIECE_BYTES + 100, 22));
 			const first = await store.importFile(path, BLOB_PIECE_BYTES);
 			const again = await store.importFile(path, BLOB_PIECE_BYTES);
 			expect(reported(again), 'the second import').to.deep.equal(reported(first));
@@ -280,7 +294,7 @@ function registerFileCases(name: string, current: () => PieceStoreHarness): void
 		});
 
 		it('exports the pieces joined in order', async () => {
-			const bytes = pieceBytes(3 * BLOB_PIECE_BYTES + 5, 23);
+			const bytes = fileBytes(3 * BLOB_PIECE_BYTES + 5, 23);
 			const imported = await store.importFile(await files.write(bytes), BLOB_PIECE_BYTES);
 			const target = await files.freshPath();
 			await store.exportFile(imported.map(leaf => leaf.id), target);
@@ -294,9 +308,9 @@ function registerFileCases(name: string, current: () => PieceStoreHarness): void
 		});
 
 		it('exporting over an existing file replaces it', async () => {
-			const bytes = pieceBytes(1000, 24);
+			const bytes = fileBytes(1000, 24);
 			const imported = await store.importFile(await files.write(bytes), BLOB_PIECE_BYTES);
-			const target = await files.write(pieceBytes(5000, 25));
+			const target = await files.write(fileBytes(5000, 25));
 			await store.exportFile(imported.map(leaf => leaf.id), target);
 			expect(sameBytes(await files.read(target), bytes), 'the replaced file').to.equal(true);
 		});
@@ -310,7 +324,7 @@ function registerFileCases(name: string, current: () => PieceStoreHarness): void
 			await rejects(() => store.exportFile([held.id, absent], fresh), 'exporting to a fresh path');
 			expect(await files.read(fresh), 'nothing left at the fresh path').to.equal(undefined);
 
-			const kept = pieceBytes(300, 28);
+			const kept = fileBytes(300, 28);
 			const existing = await files.write(kept);
 			await rejects(() => store.exportFile([absent], existing), 'exporting over an existing file');
 			expect(sameBytes(await files.read(existing), kept), 'the existing file unchanged').to.equal(true);
