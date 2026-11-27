@@ -258,6 +258,11 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 		 * row references is kept, and a blob put inside a transaction that never referenced it is
 		 * NOT — put it outside any transaction and reference it within the holding period, or pass
 		 * an explicit `owner` and release that pin yourself, to keep one no row references.
+		 *
+		 * `await blobs.pathAccess()` is the pair of FILE PATH forms — store a blob straight from a
+		 * file, write one straight out to a file, the bytes never passing through JavaScript — for a
+		 * network whose store offers them, and `undefined` for one that does not (docs/blobs.md
+		 * §Putting and reading by file path). A path put is pinned exactly as `put` is.
 		 */
 		blobs,
 		/**

@@ -6,6 +6,7 @@
 import type {
 	BlobDurabilityEvent,
 	BlobFetchOptions,
+	BlobPathAccess,
 	BlobProgressEvent,
 	BlobPutOptions,
 	BlobPutResult,
@@ -86,17 +87,48 @@ export class SqlBlobService implements SqlBlobBackendService {
 	 * outside any transaction or pass an explicit `owner`.
 	 */
 	async put(source: AsyncIterable<Uint8Array>, options?: BlobPutOptions): Promise<BlobPutResult> {
-		// Only a put whose label THIS defaulted to a transaction is that transaction's to release.
-		const defaulted = options?.owner === undefined ? this.defaultPinOwner() : undefined;
-		const owner = options?.owner ?? defaulted!.label;
+		return await this.pinnedPut(
+			options?.owner,
+			() => this.backendNow(),
+			(backend, owner) => backend.service.put(source, { ...options, owner }),
+		);
+	}
+
+	/**
+	 * Putting and reading a blob BY FILE PATH on this network, under this service's pin rules, or
+	 * `undefined` when this network's backend offers no path access — which is the case in every
+	 * browser, on any backend whose piece store cannot reach files, and on every node that left the
+	 * `blobs.paths` setting at its default `'off'` (docs/blobs.md §Putting and reading by file path).
+	 *
+	 * A method rather than the `BlobService.paths` PROPERTY, which this service therefore never
+	 * sets: the backend is resolved asynchronously ({@link backendNow}), so nothing here can answer
+	 * synchronously whether path access exists, and a property that was present-but-throwing would
+	 * break the one thing its contract promises — present exactly when available. A host asks
+	 * `await plugin.blobs.pathAccess()` once and gets the same two answers the property gives.
+	 *
+	 * `putFile` is {@link put} by another route: the same default owner, chosen when the put starts,
+	 * and the same recording on the transaction that defaulted it, because both go through one
+	 * method and so cannot drift. `readToFile` reads and is the backend's own — a read pins nothing.
+	 *
+	 * The backend is captured ONCE, as this resolves, and the returned object uses that one for both
+	 * forms and for the key a recorded put is noted under. The factory hands this service a
+	 * different backend only across a `CollectionFactory.dispose()` ({@link adoptBackend}); an
+	 * object taken before that goes on writing into the store it was taken over, which is the
+	 * host's to notice — take a fresh one after disposing.
+	 */
+	async pathAccess(): Promise<BlobPathAccess | undefined> {
 		const backend = await this.backendNow();
-		const result = await backend.service.put(source, { ...options, owner });
-		const open = this.bridge.getCurrentTransaction();
-		if (defaulted?.transactionId !== undefined
-			&& open?.isActive === true && open.stampId === defaulted.transactionId) {
-			this.bridge.noteBlobPut(backend.key, result.ref);
-		}
-		return result;
+		const paths = backend.service.paths;
+		if (paths === undefined) return undefined;
+		return {
+			mode: paths.mode,
+			putFile: (path, options) => this.pinnedPut(
+				options?.owner,
+				async () => backend,
+				(_, owner) => paths.putFile(path, { ...options, owner }),
+			),
+			readToFile: (ref, path, options) => paths.readToFile(ref, path, options),
+		};
 	}
 
 	/** What THIS machine knows about a blob; `probe` asks the blob's cohort, on a network backend. */
@@ -178,6 +210,38 @@ export class SqlBlobService implements SqlBlobBackendService {
 				this.releaseDurability = undefined;
 			}
 		};
+	}
+
+	/**
+	 * The pin rules of every put this service makes, which {@link put} documents in full, around
+	 * whichever backend call stores the bytes. One method so a stream put and a path put cannot
+	 * drift, and the order within it is load-bearing twice over: the label is chosen BEFORE anything
+	 * is awaited, so it names the transaction open when the put STARTED rather than whichever one is
+	 * open once the backend has resolved, and the recording happens after the bytes are down, when
+	 * that transaction may no longer be the open one.
+	 *
+	 * @param explicitOwner The caller's own `owner`, when it gave one: that pin is the host's to
+	 *   release, so nothing is defaulted and nothing is recorded on any transaction.
+	 * @param backendOf The backend whose key a recorded put is noted under. A function, and called
+	 *   only after the label is chosen, because resolving it may await — see above.
+	 * @param store Stores the bytes, under the owner label this chose.
+	 */
+	private async pinnedPut(
+		explicitOwner: string | undefined,
+		backendOf: () => Promise<BlobBackend>,
+		store: (backend: BlobBackend, owner: string) => Promise<BlobPutResult>,
+	): Promise<BlobPutResult> {
+		// Only a put whose label THIS defaulted to a transaction is that transaction's to release.
+		const defaulted = explicitOwner === undefined ? this.defaultPinOwner() : undefined;
+		const owner = explicitOwner ?? defaulted!.label;
+		const backend = await backendOf();
+		const result = await store(backend, owner);
+		const open = this.bridge.getCurrentTransaction();
+		if (defaulted?.transactionId !== undefined
+			&& open?.isActive === true && open.stampId === defaulted.transactionId) {
+			this.bridge.noteBlobPut(backend.key, result.ref);
+		}
+		return result;
 	}
 
 	/**
