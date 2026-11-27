@@ -124,8 +124,8 @@ class ShortMiddleLeafPieceStore extends FilePathPieceStore {
 	}
 }
 
-// The one store in this repository that offers file access until `FilePieceStore` gains it, so this
-// is what the file cases of the conformance suite are themselves checked against.
+// A second store offering file access, beside `FilePieceStore` in db-p2p-storage-fs: the file cases
+// of the conformance suite are checked against it here, in the package that owns them.
 runPieceStoreConformance('FilePathPieceStore', async () => {
 	const directory = await mkdtemp(join(tmpdir(), 'optimystic-piece-files-'));
 	let next = 0;
