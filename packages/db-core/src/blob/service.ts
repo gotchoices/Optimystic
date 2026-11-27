@@ -17,6 +17,27 @@ export interface BlobService {
 	announce(ref: BlobRef, scope: BlobScope): Promise<void>;
 	onProgress(listener: (event: BlobProgressEvent) => void): () => void;
 	onDurability(listener: (event: BlobDurabilityEvent) => void): () => void;
+	/** Present only when the node's piece store offers file access and `blobs.paths` is not 'off'. */
+	readonly paths?: BlobPathAccess;
+}
+
+/**
+ * Putting and reading a blob by file path, for a host whose piece store can cut a file into pieces
+ * and join pieces back into a file in its own native code, so the bytes never pass through
+ * JavaScript (docs/blobs.md §Putting and reading by file path).
+ *
+ * An optional PROPERTY rather than methods that throw: a host reads `node.blobs.paths` once and the
+ * type says the forms may be absent, which is the case in every browser, on any node whose store
+ * offers no file access, and on every node that left the `blobs.paths` setting at its default
+ * `'off'`.
+ */
+export interface BlobPathAccess {
+	/** What the node checks the store's ids against: `verify` hashes each imported piece here, `trust` takes the store's word (docs/blobs.md §Putting and reading by file path). */
+	readonly mode: 'verify' | 'trust';
+	/** `put`, from a file: the same pin, record, durability and result as `put` of the file's bytes. */
+	putFile(path: string, options?: BlobPutOptions): Promise<BlobPutResult>;
+	/** Write the whole blob to `path`, fetching what is not here first (as `fetch`); replaces any file there, and leaves nothing new there if it fails. */
+	readToFile(ref: BlobRef, path: string, options?: BlobFetchOptions): Promise<void>;
 }
 
 export interface BlobPutOptions { owner?: string; signal?: AbortSignal }

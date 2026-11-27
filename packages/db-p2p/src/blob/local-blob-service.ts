@@ -1,8 +1,17 @@
 import {
+	BLOB_PIECE_BYTES,
+	BlobImportError,
+	BlobTreeAssembler,
 	BlobUnavailableError,
 	buildBlob,
+	checkPiece,
+	cidOfPiece,
 	defaultBlobDigest,
 	parseBlobRef,
+	parsePieceId,
+	pieceIdOfCid,
+	planBlobRange,
+	RAW_CODEC,
 	readBlob,
 	rootPieceId,
 	walkBlobPieces,
@@ -10,6 +19,7 @@ import {
 	type BlobDurability,
 	type BlobDurabilityEvent,
 	type BlobFetchOptions,
+	type BlobPathAccess,
 	type BlobProgressEvent,
 	type BlobPutOptions,
 	type BlobPutResult,
@@ -31,7 +41,7 @@ import { BlobRecordFormatError, DEFAULT_BLOB_OWNER, type BlobHold, type BlobHold
 import { BlobRecordStore, type BlobRecordChange } from './blob-record-store.js';
 import { localPieceSource } from './local-piece-source.js';
 import { InProgressPieces, PieceSweeper, type BlobSweepResult } from './piece-sweeper.js';
-import type { IPieceStore } from './piece-store.js';
+import { offersFiles, type ImportedPiece, type IPieceStore, type IPieceStoreFiles } from './piece-store.js';
 import { SweepGate } from './sweep-gate.js';
 
 const log = createLogger('blob:store');
@@ -262,6 +272,18 @@ export const DEFAULT_SWEEP_DELAY_MS = 5_000;
 /** How stale a record's `lastReadAt` may be; a read writes the record only when it is older than this. */
 export const LAST_READ_RESOLUTION_MS = 60_000;
 
+/**
+ * Whether this node offers putting and reading blobs by file path, and what it checks the piece
+ * store's ids against (docs/blobs.md §Putting and reading by file path).
+ *
+ * `'off'` is the default: `BlobService.paths` does not exist, and nothing about storage, hashing or
+ * checking differs from a build without the capability. `'verify'` imports natively and then hashes
+ * every imported piece here, keeping the rule that this service checks every piece it stores.
+ * `'trust'` takes the store's ids as given, which is the store's native hash standing in for this
+ * one.
+ */
+export type BlobPathMode = 'off' | BlobPathAccess['mode'];
+
 export interface LocalBlobServiceInit {
 	readonly pieces: IPieceStore;
 	readonly kv: IKVStore;
@@ -283,6 +305,13 @@ export interface LocalBlobServiceInit {
 	 * the two must be reached late. Read, not captured, on every write.
 	 */
 	readonly ownWriteRoom?: () => OwnWriteRoom;
+	/**
+	 * Whether this service offers {@link BlobPathAccess}, and what it checks an import's ids against;
+	 * default `'off'`, which is no path access at all. {@link LocalBlobService.paths} is undefined
+	 * whatever this says when `pieces` offers no {@link IPieceStoreFiles} — every store in a browser,
+	 * and the memory store a node with no `storage` option gets.
+	 */
+	readonly paths?: BlobPathMode;
 }
 
 /**
@@ -298,6 +327,8 @@ export interface LocalBlobServiceInit {
  * pass its door onto the marks on the blobs it keeps for the network ({@link BlobReclaimRecords}).
  */
 export class LocalBlobService implements BlobService, BlobOwedRecords, BlobResponsibleRecords, BlobPinIndex, BlobCacheRecords, BlobByteRecords, BlobReclaimRecords {
+	/** {@link BlobPathAccess}, or undefined: the store offers no file access, or `paths` was `'off'`. */
+	readonly paths: BlobPathAccess | undefined;
 	private readonly pieces: IPieceStore;
 	private readonly records: BlobRecordStore;
 	private readonly gate = new SweepGate();
@@ -337,6 +368,27 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobRespo
 			storePiece: (ref, id, bytes) => this.storeFetchedPiece(ref, id, bytes),
 			markWhole: (ref, size) => this.correctRecord(ref, true, size),
 			markPartial: (ref, size) => this.correctRecord(ref, false, size),
+		};
+		this.paths = this.pathAccess(init.pieces, init.paths ?? 'off');
+	}
+
+	/**
+	 * {@link paths} over a store that offers file access, or undefined. The one line it logs says
+	 * what a host that turned the setting on actually got, which is the answer to "why is
+	 * `node.blobs.paths` undefined"; logged here rather than at the node's wiring so a host that
+	 * built this service directly (`SingleMachineBlobService`) sees it too.
+	 */
+	private pathAccess(store: IPieceStore, mode: BlobPathMode): BlobPathAccess | undefined {
+		// A const, so the narrowing survives into the closures below.
+		const files = offersFiles(store) ? store : undefined;
+		log('blob:paths mode=%s available=%s', mode, files !== undefined);
+		if (mode === 'off' || files === undefined) {
+			return undefined;
+		}
+		return {
+			mode,
+			putFile: (path, options) => this.putFile(files, mode, path, options),
+			readToFile: (ref, path, options) => this.readToFile(files, ref, path, options),
 		};
 	}
 
@@ -413,12 +465,26 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobRespo
 	 * written — so a refused put leaves no pieces behind and no sweep to run.
 	 */
 	async put(source: AsyncIterable<Uint8Array>, options: BlobPutOptions = {}): Promise<BlobPutResult> {
+		return this.putPieces(options, mine => buildBlob(source, this.sinkFor(mine), { digest: this.digest, signal: options.signal }));
+	}
+
+	/**
+	 * Everything every put does around the step that stores its pieces: the owner and space checks
+	 * before the first byte, the pieces flushed before the record that names them, the pin written
+	 * and flushed after, and the sweep scheduled by a failure that had already stored something.
+	 * `build` must add the id of every piece it stores to the set it is handed before that piece
+	 * reaches the store, so no sweep can take it before the record exists ({@link sinkFor}).
+	 *
+	 * Shared by {@link put} and {@link putFile} so the two cannot come to differ about the order a
+	 * put's writes land in, which is what a crash mid-put is judged against.
+	 */
+	private async putPieces(options: BlobPutOptions, build: (mine: Set<PieceId>) => Promise<BlobPutResult>): Promise<BlobPutResult> {
 		const owner = options.owner ?? DEFAULT_BLOB_OWNER;
 		assertOwner(owner);
 		this.requireRoomForOwnWrite('put');
 		const mine = new Set<PieceId>();
 		try {
-			const result = await buildBlob(source, this.sinkFor(mine), { digest: this.digest, signal: options.signal });
+			const result = await build(mine);
 			await this.pieces.flush();
 			await this.changeRecord(result.ref, current => recordAfterPut(current, result, owner, this.now()));
 			await this.records.flush();
@@ -433,6 +499,164 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobRespo
 		} finally {
 			this.inProgress.release(mine);
 		}
+	}
+
+	/**
+	 * {@link BlobPathAccess.putFile}: {@link put}, with the file's leaves cut, hashed and stored by
+	 * the piece store in its own code rather than streamed through this process (docs/blobs.md
+	 * §Putting and reading by file path). The same owner and space checks, the same pin, record,
+	 * flush order and result, and the same reference `put` of the file's bytes would give — or the
+	 * put fails, since a reference built from leaves cut or named differently would name the host's
+	 * bytes by a hash no other machine agrees with.
+	 *
+	 * Throws {@link NodeOutOfSpaceError} before the import starts, as `put` does before its first
+	 * piece; `BlobImportError` for an import this service will not build a tree from; and whatever
+	 * the store's `importFile` rejects with.
+	 */
+	private putFile(files: IPieceStoreFiles, mode: BlobPathAccess['mode'], path: string, options: BlobPutOptions = {}): Promise<BlobPutResult> {
+		return this.putPieces(options, async mine => {
+			const leaves = await this.importLeaves(files, path, mine);
+			options.signal?.throwIfAborted();
+			assertImportedLeaves(leaves, path);
+			if (mode === 'verify') {
+				await this.verifyImported(leaves);
+			}
+			options.signal?.throwIfAborted();
+			return this.treeOverLeaves(leaves, mine, options.signal);
+		});
+	}
+
+	/** The store's leaves for `path`, each reported id protected from the sweep before the gate is released. */
+	private importLeaves(files: IPieceStoreFiles, path: string, mine: Set<PieceId>): Promise<ImportedPiece[]> {
+		// NOTE: accepted tradeoff — the whole import runs inside ONE shared hold of the sweep gate, so
+		// a sweep waits for it, seconds for a large file, where a stream put holds the gate per piece.
+		// An import cannot hold per piece: its pieces are in the store before this service hears their
+		// ids, and a sweep running between the store's write and `inProgress.add` would delete them as
+		// orphans. Weighed against widening the store's contract to report each leaf as it lands, and
+		// the simpler hold kept; revisit if a sweep is ever seen stalled behind an import.
+		return this.gate.shared(async () => {
+			// A rejected import may have stored leaves it never got to report, which no set of ids this
+			// put holds can cover; the sweep is the only thing that will find them.
+			const leaves = await files.importFile(path, BLOB_PIECE_BYTES).catch((error: unknown) => {
+				this.scheduleSweep();
+				throw error;
+			});
+			for (const leaf of leaves) {
+				// An id the file repeats is counted once, as `sinkFor` counts a repeat within one blob.
+				if (!mine.has(leaf.id)) {
+					mine.add(leaf.id);
+					this.inProgress.add(leaf.id);
+				}
+			}
+			return leaves;
+		});
+	}
+
+	/**
+	 * Mode `verify`: every imported leaf read back and hashed here, so the rule that this service
+	 * checks every piece it stores still holds for a path put. Costs one crossing of each leaf's
+	 * bytes and one hash — but no base64 and no copy out of the host's file library, which is where
+	 * the cost a path put avoids actually is.
+	 */
+	private async verifyImported(leaves: readonly ImportedPiece[]): Promise<void> {
+		for (const leaf of leaves) {
+			const bytes = await this.pieces.get(leaf.id);
+			if (bytes === undefined) {
+				throw new BlobImportError('piece-missing', 'the import reported a leaf the store does not hold', leaf.id);
+			}
+			if (bytes.byteLength !== leaf.size) {
+				throw new BlobImportError('size-mismatch', `the store holds ${bytes.byteLength} bytes under a leaf it reported as ${leaf.size}`, leaf.id);
+			}
+			// The length is checked and bounded above, so the only fault left for `checkPiece` is the digest.
+			try {
+				await checkPiece(leaf.id, bytes, this.digest);
+			} catch (error) {
+				await this.deleteFalselyNamedPiece(leaf.id);
+				throw new BlobImportError('digest-mismatch', describe(error), leaf.id);
+			}
+		}
+	}
+
+	/**
+	 * A piece the store holds under an id that is not the hash of its bytes: removed, because a local
+	 * read takes this store's pieces as already checked (`localPieceSource`) and would otherwise serve
+	 * those bytes to a reader, and to a peer, as if this node had vouched for them. Taken outside the
+	 * sweep gate deliberately: the entry is wrong whatever else is running, and a concurrent correct
+	 * put of the same id wrote nothing — a put of a present id does not — so it is holding these same
+	 * wrong bytes.
+	 */
+	private async deleteFalselyNamedPiece(id: PieceId): Promise<void> {
+		log('blob:import-mismatch id=%s', id);
+		try {
+			await this.pieces.delete(id);
+		} catch (error) {
+			log('blob:import-delete-failed id=%s error=%s', id, describe(error));
+		}
+	}
+
+	/**
+	 * The balanced tree over leaves someone else cut: the list pieces are hashed and stored by this
+	 * service exactly as a stream put's are, so only the leaves came from the store's own hashing.
+	 */
+	private async treeOverLeaves(leaves: readonly ImportedPiece[], mine: Set<PieceId>, signal: AbortSignal | undefined): Promise<BlobPutResult> {
+		const assembler = new BlobTreeAssembler(this.sinkFor(mine), { digest: this.digest, signal });
+		let size = 0;
+		for (const { id, size: fileBytes } of leaves) {
+			await assembler.add({ cid: cidOfPiece(id), fileBytes, treeBytes: fileBytes });
+			size += fileBytes;
+		}
+		// A one-leaf file's root IS its leaf, so such a blob's reference is that leaf's id (`BlobTreeAssembler.finish`).
+		const root = await assembler.finish();
+		return { ref: parseBlobRef(pieceIdOfCid(root.cid)), size };
+	}
+
+	/**
+	 * {@link BlobPathAccess.readToFile}: the whole blob joined into `path` by the piece store, from
+	 * this machine's pieces alone. A blob not whole here rejects with BlobUnavailableError as
+	 * {@link fetch} does, before the store is asked to write anything; `NodeBlobService`'s
+	 * `paths.readToFile` is the one that fetches first.
+	 *
+	 * The data pieces are not hashed again: each was checked when it was stored, or accepted under
+	 * mode `trust`, which is that mode's stated cost. The list pieces on the way ARE decoded, bounded
+	 * and size-checked, as a read checks them.
+	 */
+	private async readToFile(files: IPieceStoreFiles, ref: BlobRef, path: string, options: BlobFetchOptions = {}): Promise<void> {
+		// A use for the whole call, as every read and fetch holds one: the pieces must not be swept
+		// between the plan that listed them and the store's join of them.
+		const endUse = this.beginUse(ref);
+		try {
+			options.signal?.throwIfAborted();
+			void this.touchLastRead(ref);
+			const ids = await this.wholeBlobPieces(ref, options.signal);
+			await files.exportFile(ids, path);
+		} finally {
+			endUse();
+		}
+	}
+
+	/**
+	 * Every data piece of `ref` in order, with the list pieces above them checked on the way
+	 * (`planBlobRange`). Empty for a zero-byte blob, whose root carries no bytes and which the store
+	 * therefore joins into an empty file. A piece that is not here corrects the record to not whole,
+	 * as a read that finds one does.
+	 */
+	private async wholeBlobPieces(ref: BlobRef, signal: AbortSignal | undefined): Promise<PieceId[]> {
+		const source = this.readSource(async id => {
+			throw new BlobUnavailableError(ref, 'cohort-unreachable', id);
+		});
+		const ids: PieceId[] = [];
+		try {
+			for await (const piece of planBlobRange(ref, source, { digest: this.digest })) {
+				signal?.throwIfAborted();
+				ids.push(piece.id);
+			}
+		} catch (error) {
+			if (error instanceof BlobUnavailableError) {
+				await this.correctRecord(ref, false);
+			}
+			throw error;
+		}
+		return ids;
 	}
 
 	/**
@@ -1033,6 +1257,51 @@ interface BlobCensus {
 	readonly whole: boolean;
 }
 
+/**
+ * The import's own check, before any tree is built: a reference over leaves cut or named differently
+ * from what this builder would produce is not the reference a stream put of the same bytes gives, so
+ * the put fails here rather than naming the host's bytes by a hash no other machine agrees with.
+ */
+function assertImportedLeaves(leaves: readonly ImportedPiece[], path: string): void {
+	if (leaves.length === 0) {
+		throw new BlobImportError('no-pieces', `importing ${path} reported no pieces; even an empty file has one`);
+	}
+	leaves.forEach((leaf, index) => {
+		assertRawPieceId(leaf, path);
+		assertLeafSize(leaf, index, leaves.length, path);
+	});
+}
+
+/** A raw-codec SHA-256 id in the canonical spelling: what `rawPieceIdOfDigest` gives, and nothing else. */
+function assertRawPieceId({ id }: ImportedPiece, path: string): void {
+	try {
+		parsePieceId(id);
+	} catch (error) {
+		throw new BlobImportError('not-a-raw-piece', `importing ${path} reported ${describe(error)}`, id);
+	}
+	if (cidOfPiece(id).code !== RAW_CODEC) {
+		throw new BlobImportError('not-a-raw-piece', `importing ${path} named a leaf with the list-piece codec`, id);
+	}
+}
+
+/** Exactly the lengths cutting at BLOB_PIECE_BYTES gives. */
+function assertLeafSize({ id, size }: ImportedPiece, index: number, count: number, path: string): void {
+	if (!isCutLeafSize(size, index === count - 1, count)) {
+		throw new BlobImportError('size-mismatch', `importing ${path} reported ${size} bytes for leaf ${index + 1} of ${count}, cut at ${BLOB_PIECE_BYTES}`, id);
+	}
+}
+
+function isCutLeafSize(size: number, last: boolean, count: number): boolean {
+	if (!Number.isSafeInteger(size) || size < 0) {
+		return false;
+	}
+	if (!last) {
+		return size === BLOB_PIECE_BYTES;
+	}
+	// The last leaf is short, or full when the file divides exactly; zero only for an empty file.
+	return size <= BLOB_PIECE_BYTES && (size > 0 || count === 1);
+}
+
 function assertOwner(owner: string): void {
 	if (owner === '') {
 		throw new RangeError('A blob pin owner must be a non-empty string');
@@ -1066,7 +1335,7 @@ function withPin(holds: readonly BlobHold[], owner: string, at: number): readonl
 
 // NOTE: from here to `cacheOnly` is the module's record-shaping block — pure `BlobRecord` in,
 // `BlobRecord` out, none of it touching the class. It is what has grown with each hold the service
-// learned, and the file is 1150 lines with it (`wc -l`). If it grows again, move the block to its own
+// learned, and the file is 1548 lines with it (`wc -l`). If it grows again, move the block to its own
 // `blob-record-changes.ts`; splitting it is a rename, since every function in it is module-private.
 /** The owner's pin added unless it already pins it, the size set and the blob whole; every other hold and field kept. */
 function recordAfterPut(current: BlobRecord | undefined, { ref, size }: BlobPutResult, owner: string, at: number): BlobRecord {

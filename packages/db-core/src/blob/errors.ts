@@ -72,6 +72,32 @@ export class BlobCorruptError extends Error {
 	}
 }
 
+/** Why a piece store's file import was refused; see {@link BlobImportError}. */
+export type BlobImportReason =
+	/** The store reported no leaves at all. Even an empty file has one, so this is a broken store. */
+	| 'no-pieces'
+	/** A reported id is not a raw-codec SHA-256 piece id in its canonical spelling. */
+	| 'not-a-raw-piece'
+	/** A reported leaf length is not one that cutting the file at the service's piece size gives. */
+	| 'size-mismatch'
+	/** A reported leaf is not in the store, so the import did not store what it said it had. */
+	| 'piece-missing'
+	/** A reported leaf's stored bytes do not hash to the id the store gave it (mode `verify` only). */
+	| 'digest-mismatch';
+
+/**
+ * A piece store's `importFile` reported leaves this node will not build a reference from
+ * (docs/blobs.md §Putting and reading by file path): the reference would not be the one a stream
+ * put of the same bytes gives, so the put fails rather than naming bytes by a hash nothing else
+ * would agree with. Whatever the import stored is left for the piece sweep.
+ */
+export class BlobImportError extends Error {
+	constructor(readonly reason: BlobImportReason, detail: string, readonly pieceId?: PieceId) {
+		super(`Blob file import refused (${reason})${pieceId === undefined ? '' : `, piece ${pieceId}`}: ${detail}`);
+		this.name = 'BlobImportError';
+	}
+}
+
 /** A digest function gave a wrong answer, or threw, on a known SHA-256 input. */
 export class BlobDigestError extends Error {
 	constructor(detail: string, options?: ErrorOptions) {

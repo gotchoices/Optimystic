@@ -14,6 +14,7 @@ import {
 	rootPieceId,
 	type BlobDurabilityEvent,
 	type BlobFetchOptions,
+	type BlobPathAccess,
 	type BlobProgressEvent,
 	type BlobPutOptions,
 	type BlobPutResult,
@@ -93,6 +94,8 @@ interface ProbeResult {
 export class NodeBlobService implements BlobService, BlobPinIndex {
 	/** The single-machine service underneath; the blob protocol service answers from it, and tests reach its fetch door through it. */
 	readonly local: LocalBlobService;
+	/** {@link BlobService.paths}: defined exactly when the single-machine service's is. */
+	readonly paths: BlobPathAccess | undefined;
 	private readonly fetcher: Pick<BlobFetcher, 'start' | 'onPieceStored'>;
 	private readonly client: Pick<BlobProtocolClient, 'stat' | 'wireBytes'>;
 	private readonly holders: BlobHolderDeps;
@@ -116,6 +119,7 @@ export class NodeBlobService implements BlobService, BlobPinIndex {
 		this.now = deps.now ?? Date.now;
 		// Never unsubscribed: the fetcher lives exactly as long as the node, and so does this service.
 		this.fetcher.onPieceStored(event => this.pieceStored(event));
+		this.paths = pathAccessOverNetwork(deps.local, (ref, options) => this.fetch(ref, options));
 	}
 
 	put(source: AsyncIterable<Uint8Array>, options?: BlobPutOptions): Promise<BlobPutResult> {
@@ -461,4 +465,34 @@ export class NodeBlobService implements BlobService, BlobPinIndex {
 
 function describe(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * {@link BlobService.paths} over the network (docs/blobs.md §Putting and reading by file path). The
+ * put is the single-machine one — nothing leaves the machine until the reference commits, path put
+ * or not — and the export runs this service's own `fetch` first, so a blob only partly here is
+ * brought here through the fetcher, which checks every piece it stores, before the store joins the
+ * pieces into the file.
+ */
+function pathAccessOverNetwork(local: LocalBlobService, fetch: (ref: BlobRef, options?: BlobFetchOptions) => Promise<void>): BlobPathAccess | undefined {
+	const paths = local.paths;
+	if (paths === undefined) {
+		return undefined;
+	}
+	return {
+		mode: paths.mode,
+		putFile: (path, options) => paths.putFile(path, options),
+		readToFile: async (ref, path, options) => {
+			// One use across both, as `NodeBlobService.fetch` holds one from before its first piece: the
+			// fetch's own use ends when it resolves, and a blob nothing else holds could be swept in the
+			// gap before the export's use begins.
+			const endUse = local.beginUse(ref);
+			try {
+				await fetch(ref, options);
+				await paths.readToFile(ref, path, options);
+			} finally {
+				endUse();
+			}
+		},
+	};
 }

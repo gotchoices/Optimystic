@@ -1,5 +1,6 @@
 import { CID } from 'multiformats/cid';
 import { base32 } from 'multiformats/bases/base32';
+import * as Digest from 'multiformats/hashes/digest';
 import { BlobRefError } from './errors.js';
 
 declare const blobRefBrand: unique symbol;
@@ -44,6 +45,20 @@ export function rootPieceId(ref: BlobRef): PieceId {
 export function pieceIdOfCid(cid: CID): PieceId {
 	// toV1 keeps the multihash and the codec, so the re-spelt id names the same bytes.
 	return canonicalSpelling(cid.toV1()) as PieceId;
+}
+
+/**
+ * The piece id of a raw leaf whose SHA-256 digest is `digest`: CIDv1, codec raw, canonical
+ * spelling. The one way a piece store that hashed leaves itself spells the ids it reports
+ * (`IPieceStoreFiles.importFile` in `packages/db-p2p/src/blob/piece-store.ts`), so an imported
+ * leaf's id is the one a stream put of the same bytes would give. A digest that is not 32 bytes —
+ * which no SHA-256 is — throws RangeError rather than being branded as a piece id.
+ */
+export function rawPieceIdOfDigest(digest: Uint8Array): PieceId {
+	if (digest.byteLength !== SHA2_256_BYTES) {
+		throw new RangeError(`A SHA-256 digest is ${SHA2_256_BYTES} bytes, not ${digest.byteLength}`);
+	}
+	return pieceIdOfCid(CID.createV1(RAW_CODEC, Digest.create(SHA2_256_CODE, digest)));
 }
 
 /**

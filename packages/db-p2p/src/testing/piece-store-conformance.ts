@@ -1,8 +1,7 @@
 import { expect } from 'chai';
-import { CID } from 'multiformats/cid';
 import { sha256 } from 'multiformats/hashes/sha2';
-import { BLOB_PIECE_BYTES, MAX_BLOB_PIECE_BYTES, RAW_CODEC, pieceIdOfCid, type PieceId } from '@optimystic/db-core';
-import type { IPieceStore } from '../blob/piece-store.js';
+import { BLOB_PIECE_BYTES, MAX_BLOB_PIECE_BYTES, rawPieceIdOfDigest, type PieceId } from '@optimystic/db-core';
+import { offersFiles, type ImportedPiece, type IPieceStore, type IPieceStoreFiles } from '../blob/piece-store.js';
 
 /** What `makeStore` hands each conformance case; see {@link runPieceStoreConformance}. */
 export interface PieceStoreHarness {
@@ -14,6 +13,22 @@ export interface PieceStoreHarness {
 	 * it has one. Required, and read only, under `{ persistent: true }`.
 	 */
 	reopen?: () => Promise<IPieceStore>;
+	/**
+	 * Reading and writing ordinary files, for the cases over {@link IPieceStoreFiles}. Required of a
+	 * harness whose store offers that capability, and never read otherwise. The suite asks rather
+	 * than reaching for `node:fs` itself because it runs in a browser and on a phone too.
+	 */
+	files?: PieceStoreFileHarness;
+}
+
+/** {@link PieceStoreHarness.files}: the file access the import and export cases need of their host. */
+export interface PieceStoreFileHarness {
+	/** Write `bytes` to a new file and return its path. */
+	write(bytes: Uint8Array): Promise<string>;
+	/** A path where no file exists yet, in a directory the store may write. */
+	freshPath(): Promise<string>;
+	/** The file's bytes, or undefined when there is none. */
+	read(path: string): Promise<Uint8Array | undefined>;
 }
 
 /** How a backend's suite is registered; see {@link runPieceStoreConformance}. */
@@ -32,11 +47,12 @@ export interface PieceStoreConformanceOptions {
 const BYTES_USED_SLACK = 4096;
 
 /**
- * The raw piece id of `bytes`: CIDv1, codec raw, sha2-256, in the canonical spelling. Built here
- * rather than with the blob builder, which never cuts a raw piece above 256 KiB.
+ * The raw piece id of `bytes`: CIDv1, codec raw, sha2-256, in the canonical spelling. Hashed here
+ * rather than with the blob builder, which never cuts a raw piece above 256 KiB; the id is spelt by
+ * the one function every store that names its own pieces spells them with.
  */
 export async function conformancePieceId(bytes: Uint8Array): Promise<PieceId> {
-	return pieceIdOfCid(CID.createV1(RAW_CODEC, await sha256.digest(bytes)));
+	return rawPieceIdOfDigest((await sha256.digest(bytes)).digest);
 }
 
 /** `length` bytes whose content differs by `seed`, so pieces of one length get distinct ids. */
@@ -187,6 +203,8 @@ export function runPieceStoreConformance(
 			}
 		});
 
+		registerFileCases(name, () => harness);
+
 		if (options.persistent) {
 			it('every put and delete resolved before flush() is read back by a fresh store over the same location', async () => {
 				if (!harness.reopen) {
@@ -210,4 +228,120 @@ export function runPieceStoreConformance(
 			});
 		}
 	});
+}
+
+/** File lengths an import must cut exactly as a stream put would; the blob builder's own vectors. */
+const FILE_LENGTHS: readonly number[] = [0, 1000, BLOB_PIECE_BYTES, BLOB_PIECE_BYTES + 1, 3 * BLOB_PIECE_BYTES + 5];
+
+/**
+ * The cases for a store that offers {@link IPieceStoreFiles} (docs/blobs.md §Putting and reading by
+ * file path). Registered for every backend and skipped for a store that does not offer it, since
+ * whether it does is known only once one has been made; a store that DOES offer it and whose harness
+ * supplies no {@link PieceStoreHarness.files} fails, rather than quietly testing none of this.
+ */
+function registerFileCases(name: string, current: () => PieceStoreHarness): void {
+	describe('file import and export', () => {
+		let store: IPieceStore & IPieceStoreFiles;
+		let files: PieceStoreFileHarness;
+
+		// A `function` body, not an arrow: `this.skip()` is how a case decides at run time that it
+		// does not apply to the backend under test.
+		beforeEach(function () {
+			const harness = current();
+			if (!offersFiles(harness.store)) {
+				this.skip();
+				return;
+			}
+			if (harness.files === undefined) {
+				throw new Error(`${name} offers IPieceStoreFiles but its harness supplies no files helpers`);
+			}
+			store = harness.store;
+			files = harness.files;
+		});
+
+		for (const length of FILE_LENGTHS) {
+			it(`imports ${length} bytes as the leaves a stream put would store`, async () => {
+				const bytes = pieceBytes(length, 21);
+				const imported = await store.importFile(await files.write(bytes), BLOB_PIECE_BYTES);
+				const slices = leafSlices(bytes);
+				expect(reported(imported), 'the ids and sizes').to.deep.equal(await expectedLeaves(slices));
+				for (const [index, slice] of slices.entries()) {
+					expect(sameBytes(await store.get(imported[index]!.id), slice), `leaf ${index}`).to.equal(true);
+				}
+			});
+		}
+
+		it('importing one file twice stores each piece once', async () => {
+			const path = await files.write(pieceBytes(BLOB_PIECE_BYTES + 100, 22));
+			const first = await store.importFile(path, BLOB_PIECE_BYTES);
+			const again = await store.importFile(path, BLOB_PIECE_BYTES);
+			expect(reported(again), 'the second import').to.deep.equal(reported(first));
+			expect((await collect(store.list())).sort(), 'stored ids').to.deep.equal(first.map(leaf => leaf.id).sort());
+		});
+
+		it('exports the pieces joined in order', async () => {
+			const bytes = pieceBytes(3 * BLOB_PIECE_BYTES + 5, 23);
+			const imported = await store.importFile(await files.write(bytes), BLOB_PIECE_BYTES);
+			const target = await files.freshPath();
+			await store.exportFile(imported.map(leaf => leaf.id), target);
+			expect(sameBytes(await files.read(target), bytes), 'the joined bytes').to.equal(true);
+		});
+
+		it('exports no pieces as an empty file', async () => {
+			const target = await files.freshPath();
+			await store.exportFile([], target);
+			expect(sameBytes(await files.read(target), new Uint8Array(0)), 'an empty file, not an absent one').to.equal(true);
+		});
+
+		it('exporting over an existing file replaces it', async () => {
+			const bytes = pieceBytes(1000, 24);
+			const imported = await store.importFile(await files.write(bytes), BLOB_PIECE_BYTES);
+			const target = await files.write(pieceBytes(5000, 25));
+			await store.exportFile(imported.map(leaf => leaf.id), target);
+			expect(sameBytes(await files.read(target), bytes), 'the replaced file').to.equal(true);
+		});
+
+		it('exporting a missing piece rejects and leaves nothing it did not find there', async () => {
+			const held = await piece(1000, 26);
+			await store.put(held.id, held.bytes);
+			const absent = (await piece(1000, 27)).id;
+
+			const fresh = await files.freshPath();
+			await rejects(() => store.exportFile([held.id, absent], fresh), 'exporting to a fresh path');
+			expect(await files.read(fresh), 'nothing left at the fresh path').to.equal(undefined);
+
+			const kept = pieceBytes(300, 28);
+			const existing = await files.write(kept);
+			await rejects(() => store.exportFile([absent], existing), 'exporting over an existing file');
+			expect(sameBytes(await files.read(existing), kept), 'the existing file unchanged').to.equal(true);
+		});
+	});
+}
+
+/** Only the two fields the contract is about, so a store carrying extra ones still compares. */
+function reported(leaves: readonly ImportedPiece[]): { id: PieceId; size: number }[] {
+	return leaves.map(({ id, size }) => ({ id, size }));
+}
+
+/** The 256 KiB slices a stream put cuts `bytes` into; one empty leaf for no bytes at all. */
+function leafSlices(bytes: Uint8Array): Uint8Array[] {
+	const slices: Uint8Array[] = [];
+	for (let offset = 0; offset < bytes.byteLength; offset += BLOB_PIECE_BYTES) {
+		slices.push(bytes.subarray(offset, Math.min(offset + BLOB_PIECE_BYTES, bytes.byteLength)));
+	}
+	return slices.length > 0 ? slices : [new Uint8Array(0)];
+}
+
+async function expectedLeaves(slices: readonly Uint8Array[]): Promise<{ id: PieceId; size: number }[]> {
+	return Promise.all(slices.map(async slice => ({ id: await conformancePieceId(slice), size: slice.byteLength })));
+}
+
+/** chai-as-promised is not a dependency of every package that runs this suite, so the assertion is spelt out. */
+async function rejects(work: () => Promise<unknown>, what: string): Promise<void> {
+	try {
+		await work();
+	} catch {
+		return;
+	}
+	throw new Error(`${what} resolved where it should have rejected`);
 }

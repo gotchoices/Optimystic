@@ -7,8 +7,11 @@ import type { StoreIdentity } from '../storage/store-identity.js';
  * canonical spelling `PieceId` has. Equal bytes have one key, so a raw piece and a list piece with
  * the same bytes share one entry.
  *
- * The store never hashes. Its one writer, the blob service, checks every piece against its id
- * before `put`; a store handed bytes that do not hash to their id keeps them as given.
+ * The store never hashes, with one exception: `importFile` on the optional {@link IPieceStoreFiles}
+ * does, and the blob service accepts the ids it reports under the node's `blobs.paths` setting
+ * (docs/blobs.md §Putting and reading by file path). Everywhere else the store's one writer, the
+ * blob service, checks every piece against its id before `put`; a store handed bytes that do not
+ * hash to their id keeps them as given.
  *
  * Deliberately not a logical store of `RawStoreDriver`: that kernel JSON-encodes every value and
  * stages writes in memory, which is wrong for megabytes of immutable bytes that need no cross-key
@@ -65,4 +68,48 @@ export interface IPieceStore {
 	storeIdentity?(): StoreIdentity;
 	/** Optional: flush, then release any handle. */
 	close?(): Promise<void>;
+}
+
+/** One raw leaf a store imported: its id and its length in bytes. */
+export interface ImportedPiece {
+	readonly id: PieceId;
+	readonly size: number;
+}
+
+/**
+ * Optional on a piece store: pieces as files the host's native code cuts, hashes and joins, so their
+ * bytes never pass through JavaScript (docs/blobs.md §Putting and reading by file path). On a phone,
+ * passing a photo's bytes through JavaScript and a base64 bridge costs seconds per megabyte, and
+ * these two calls are what a host with native file access offers instead.
+ *
+ * A store that implements one of the two implements both: {@link offersFiles} is what the blob
+ * service asks, and a store that answered it with only half the capability would fail a put or an
+ * export at the call. Every such store also passes the file cases of `runPieceStoreConformance`
+ * (`packages/db-p2p/src/testing/piece-store-conformance.ts`), which pin the cut, the ids and the
+ * atomicity below.
+ */
+export interface IPieceStoreFiles {
+	/**
+	 * Read the file at `path` (a path or URI the platform's file API accepts), cut it into raw leaves
+	 * of exactly `pieceSize` bytes (the last one shorter; one zero-length leaf for an empty file),
+	 * name each by the SHA-256 of its bytes as a raw-codec CIDv1 in the canonical spelling
+	 * (`rawPieceIdOfDigest` in `packages/db-core/src/blob/blob-ref.ts`), store each as `put` would,
+	 * and return them in file order. Resolves once every leaf is stored (in this process; durability
+	 * is `flush`'s, as for `put`). A rejection may leave some leaves stored. The point of the
+	 * capability is that a host can do all of this in native code; how it does so is the store's.
+	 */
+	importFile(path: string, pieceSize: number): Promise<ImportedPiece[]>;
+	/**
+	 * Write the stored pieces `ids`, concatenated in order, to `path`, replacing any file there.
+	 * Atomic for the caller: on success `path` holds exactly the joined bytes; on any failure (a
+	 * missing piece included) nothing is left at `path` that was not there before — write to a
+	 * temporary name beside it and rename.
+	 */
+	exportFile(ids: readonly PieceId[], path: string): Promise<void>;
+}
+
+/** Whether `store` offers {@link IPieceStoreFiles}. */
+export function offersFiles(store: IPieceStore): store is IPieceStore & IPieceStoreFiles {
+	const files = store as Partial<IPieceStoreFiles>;
+	return typeof files.importFile === 'function' && typeof files.exportFile === 'function';
 }

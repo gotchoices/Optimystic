@@ -10,6 +10,7 @@ import type {
 	BlobDurability,
 	BlobDurabilityEvent,
 	BlobFetchOptions,
+	BlobPathAccess,
 	BlobProgressEvent,
 	BlobPutOptions,
 	BlobPutResult,
@@ -23,7 +24,7 @@ import { KeyedSerialQueue } from '../keyed-serial-queue.js';
 import { createLogger } from '../logger.js';
 import type { IKVStore } from '../storage/i-kv-store.js';
 import { assertAnnounceScope } from './blob-protocol.js';
-import { LocalBlobService, type BlobPinIndex } from './local-blob-service.js';
+import { LocalBlobService, type BlobPathMode, type BlobPinIndex } from './local-blob-service.js';
 import type { IPieceStore } from './piece-store.js';
 
 const log = createLogger('blob:store');
@@ -34,6 +35,8 @@ export interface SingleMachineBlobServiceInit {
 	/** Default `defaultBlobDigest()`, as LocalBlobServiceInit's. */
 	readonly digest?: BlobDigest;
 	readonly now?: () => number;
+	/** Whether this machine offers putting and reading blobs by file path, as `LocalBlobServiceInit.paths`; default `'off'`. */
+	readonly paths?: BlobPathMode;
 }
 
 /**
@@ -46,12 +49,15 @@ export interface SingleMachineBlobServiceInit {
  * wraps; every member but `announce` is a delegation.
  */
 export class SingleMachineBlobService implements BlobService, BlobPinIndex {
+	/** {@link BlobService.paths}, the local service's: this machine is the whole cohort, so there is nothing to fetch before an export. */
+	readonly paths: BlobPathAccess | undefined;
 	private readonly local: LocalBlobService;
 	/** Serializes `announce` per reference, as `BlobCopyDrain.settleRef` does for the same reason: read-decide-write over one record. */
 	private readonly announces = new KeyedSerialQueue();
 
 	constructor(init: SingleMachineBlobServiceInit) {
-		this.local = new LocalBlobService({ pieces: init.pieces, kv: init.kv, digest: init.digest, now: init.now });
+		this.local = new LocalBlobService({ pieces: init.pieces, kv: init.kv, digest: init.digest, now: init.now, paths: init.paths });
+		this.paths = this.local.paths;
 	}
 
 	/** Schedules the start-up sweep (LocalBlobService.start). */

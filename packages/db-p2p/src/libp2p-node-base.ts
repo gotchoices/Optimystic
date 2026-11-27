@@ -22,7 +22,7 @@ import { durabilityWindowMs, resolveDurabilityWindowPolicy, type DurabilityWindo
 import { memoryNodeStorage, type NodeStorage } from './storage/node-storage.js';
 import { KvUnderReplicationLedger } from './repo/kv-under-replication-ledger.js';
 import { KvHlcClockStore } from './storage/kv-hlc-clock-store.js';
-import { LocalBlobService } from './blob/local-blob-service.js';
+import { LocalBlobService, type BlobPathMode } from './blob/local-blob-service.js';
 import { BlobCacheBudget, DEFAULT_BLOB_CACHE_BUDGET_BYTES } from './blob/cache-budget.js';
 import { blobProtocolService } from './blob/blob-protocol-service.js';
 import { blobAcceptanceOf } from './blob/accepts-blobs.js';
@@ -387,8 +387,22 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * `DEFAULT_RECLAIM_GRACE_MS` (7 days). Two counting passes at least this far apart must both have
 	 * found the blob unlisted, so the period is a floor on the real time between them, not a timer.
 	 * Anything below `MIN_RECLAIM_GRACE_MS` (1 hour), or not finite, throws.
+	 *
+	 * `paths` is whether this node offers putting and reading blobs BY FILE PATH, for a host whose
+	 * piece store can cut a file into pieces and join pieces back into a file in its own native code
+	 * (docs/blobs.md §Putting and reading by file path), default `'off'`. `'off'` means
+	 * `node.blobs.paths` does not exist and nothing about storage, hashing or checking differs from a
+	 * build without the capability. `'verify'` imports natively and
+	 * then hashes every imported piece here, keeping the rule that the node checks every piece it
+	 * stores. `'trust'` takes the store's ids as given, which trades that check for the store's own
+	 * native hash — sound because every machine that fetches a piece checks it against its id, so a
+	 * wrong id makes other machines refuse the piece rather than accept bad bytes, at the cost that
+	 * this machine will serve and locally read a piece it never checked. `node.blobs.paths` is
+	 * undefined whatever this says when the node's piece store offers no file access, which is every
+	 * browser store and the memory store a node with no `storage` option gets; the node says which it
+	 * got in one `blob:paths` line (docs/debugging.md, the `blob:store` namespace).
 	 */
-	blobs?: { digest?: BlobDigest; hold?: BlobHoldPolicy; cacheBudgetBytes?: number; reclaimGraceMs?: number; copy?: Partial<BlobCopyDrainConfig> & { enabled?: boolean } };
+	blobs?: { digest?: BlobDigest; hold?: BlobHoldPolicy; cacheBudgetBytes?: number; reclaimGraceMs?: number; paths?: BlobPathMode; copy?: Partial<BlobCopyDrainConfig> & { enabled?: boolean } };
 	/**
 	 * Override libp2p listen multiaddrs. An entry naming a relay (`<relay address>/p2p/<relay id>/p2p-circuit`)
 	 * is not handed to libp2p as written: the node listens on a bare `/p2p-circuit` and keeps the
@@ -1438,7 +1452,7 @@ export async function createLibp2pNodeBase(
 	// one of the three has to be reached late. A `put` or `pin` before the first sample has room, as a
 	// node that cannot measure itself always does.
 	const blobs = new LocalBlobService({
-		pieces: pieceStore, kv: kvStore, digest: options.blobs?.digest,
+		pieces: pieceStore, kv: kvStore, digest: options.blobs?.digest, paths: options.blobs?.paths,
 		// Return type annotated, not inferred: `blobs` → this thunk → `storagePressure` → `storageAccount`
 		// → its own `blobRecords` thunk → `blobs` is a type cycle TypeScript cannot resolve on its own.
 		ownWriteRoom: (): OwnWriteRoom => storagePressure.ownWriteRoom()

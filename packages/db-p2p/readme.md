@@ -521,6 +521,33 @@ const node = await createLibp2pNode({
 
 At the defaults every cohort of two or more members gets the 5000 ms cap. The window matters only on storage that can sync (`durability: 'power-loss'`); a `'process-crash'` backend cannot sync at all, so a power cut may lose any write the operating system has not yet written out, whatever the window. The node's start-up storage line reports the windows in force. An out-of-range value throws at node construction.
 
+### Storing and reading blobs by file path (`blobs.paths`)
+
+`node.blobs.put` takes a stream of byte arrays and `read` yields one, because Optimystic owns no file access. On a phone that is the expensive part: the bytes cross a native bridge, usually as base64, and are copied again to be hashed, which the Sereus Chat team measured at 1.1–1.4 s to store a 1 MB photo on a Galaxy S7 against 0.18–0.57 s for the same work in native code. A piece store whose host can reach files itself may offer to cut, hash and join them there, and `blobs.paths` is how a host turns that on. It is **off by default**: this is the code that decides which bytes a node vouches for, so using it is a deliberate choice.
+
+```typescript
+const node = await createLibp2pNode({
+  networkName: 'my-net',
+  storage,                 // its `pieces` store is what has to offer the capability
+  blobs: { paths: 'verify' },  // 'off' (default) | 'verify' | 'trust'
+});
+
+// May be undefined: no store in a browser offers file access, and `paths: 'off'` has no forms at all.
+const paths = node.blobs.paths;
+if (paths !== undefined) {
+  const { ref } = await paths.putFile('/data/incoming/photo.jpg');
+  await paths.readToFile(ref, '/data/outgoing/photo.jpg');
+} else {
+  // Fall back to the stream forms, which every node has.
+}
+```
+
+- **`'off'`** — `node.blobs.paths` is undefined and nothing about storage, hashing or checking differs from a build without the capability. Turning the option back to `'off'`, or removing it, is the whole of turning this off; blobs already stored are ordinary blobs and nothing has to be re-stored.
+- **`'verify'`** — the store imports the file natively, then the node reads each imported piece back and hashes it, so it still checks every piece it stores. The crossing and the hash cost something; the base64 trip and the copy out of the file library, which cost more, are gone.
+- **`'trust'`** — the node takes the store's ids as given. Sound for the network, because every machine that fetches a piece checks it against its id, but this machine will then serve and locally read a piece it never checked itself.
+
+`node.blobs.paths` is undefined whenever the piece store offers no file access, whatever the option says — so a host checks it once rather than catching a failure. The node logs one `blob:paths` line with the mode it was given and whether the store offered the capability; what each mode guarantees, what `trust` gives up, and what a store must do to offer the capability are in [docs/blobs.md §Putting and reading by file path](../../docs/blobs.md#putting-and-reading-by-file-path).
+
 ### External Client Operations
 
 ```typescript
