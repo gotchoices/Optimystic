@@ -3222,16 +3222,32 @@ export class ClusterMember implements ICluster {
 	 * collection's pend is the record's answer, whichever operation it came from.
 	 */
 	private async applyConsensusPends(record: ClusterRecord, pends: readonly PendRequest[]): Promise<void> {
-		const results: PendResult[] = [];
-		for (const pend of pends) {
-			results.push(await this.applyConsensusPend(record, pend));
-		}
+		const storage = this.localApply();
+		const apply = { syncWithinMs: this.syncWindowFor(record) };
+		// One storage write group for the whole record where storage offers one
+		// (`ILocalApply.applyInOneGroup`): a record covering several collections then costs one flush
+		// rather than one per collection, and each pend's group note runs after it. A plain `IRepo`
+		// mock has no group, and then each pend flushes on its own as before.
+		const results: PendResult[] = storage.applyInOneGroup === undefined
+			? await this.pendEachInOrder(request => storage.pend(request, undefined, apply), record, pends)
+			: await storage.applyInOneGroup(apply, group => this.pendEachInOrder(request => group.pend(request), record, pends));
 		this.executedPendResults.set(record.messageHash, foldPendResults(results));
 	}
 
+	/** {@link applyConsensusPends}'s loop, over a lone `pend` or a group's. */
+	private async pendEachInOrder(
+		apply: (request: PendRequest) => Promise<PendResult>, record: ClusterRecord, pends: readonly PendRequest[]
+	): Promise<PendResult[]> {
+		const results: PendResult[] = [];
+		for (const request of pends) {
+			results.push(await this.applyConsensusPend(apply, record, request));
+		}
+		return results;
+	}
+
 	/** Apply one pend operation of a consensus record to storage, keeping its per-block refusal. */
-	private async applyConsensusPend(record: ClusterRecord, pend: PendRequest): Promise<PendResult> {
-		const result = await this.localApply().pend(pend, undefined, { syncWithinMs: this.syncWindowFor(record) });
+	private async applyConsensusPend(apply: (request: PendRequest) => Promise<PendResult>, record: ClusterRecord, pend: PendRequest): Promise<PendResult> {
+		const result = await apply(pend);
 		// Second, actionId-keyed retention for the commit tier: this same refusal must still be
 		// findable when THIS action's commit record (a different messageHash) arrives for a
 		// promise vote, so a member cannot co-sign the commit of a pend it just refused. Only
@@ -3282,12 +3298,32 @@ export class ClusterMember implements ICluster {
 		const actionId = commits[0]!.actionId;
 		await this.captureConsensusCommitCert(record, actionId, committedTailIds(commits));
 		const proof = this.consensusCommitProof(record, actionId);
-		const operations: CommitOperationVerdict[] = [];
-		for (const commit of commits) {
-			const { applied, behind } = await this.applyCommitToStorage(record, commit, proof);
-			operations.push({ commit, verdict: await this.durableCommitVerdict(commit, applied), behind });
-		}
+		const storage = this.localApply();
+		const apply = { syncWithinMs: this.syncWindowFor(record) };
+		// One storage write group for the whole record where storage offers one, as in
+		// {@link applyConsensusPends}. The cert captured above is therefore still retained when the
+		// group's emissions resolve it, since those now run later, not sooner.
+		const operations: CommitOperationVerdict[] = storage.applyInOneGroup === undefined
+			? await this.commitEachInOrder(request => storage.commit(request, undefined, { proof, ...apply }), record, commits)
+			: await storage.applyInOneGroup(apply, group => this.commitEachInOrder(request => group.commit(request, undefined, proof), record, commits));
 		this.retainCommitVerdicts(record, operations);
+	}
+
+	/**
+	 * {@link applyConsensusCommits}'s loop, over a lone `commit` or a group's. Each operation's
+	 * durable verdict is read here, inside the group: it reads this process's own writes, which is
+	 * correct for a verdict that is retained rather than announced until the record's answer goes out
+	 * — and the answer leaves only once `applyConsensusCommits` has returned, after the group's flush.
+	 */
+	private async commitEachInOrder(
+		apply: (request: CommitRequest) => Promise<CommitResult>, record: ClusterRecord, commits: readonly CommitRequest[]
+	): Promise<CommitOperationVerdict[]> {
+		const operations: CommitOperationVerdict[] = [];
+		for (const request of commits) {
+			const { applied, behind } = await this.applyCommitToStorage(apply, record, request);
+			operations.push({ commit: request, verdict: await this.durableCommitVerdict(request, applied), behind });
+		}
+		return operations;
 	}
 
 	/**
@@ -3358,12 +3394,22 @@ export class ClusterMember implements ICluster {
 	 * is what makes a refusal eligible for {@link reconcileRefusedCommit}. Genuine faults (a
 	 * bare-reason returned failure, an unrecognized throw) propagate so {@link handleConsensus} rolls
 	 * back the executed marker and rethrows.
+	 *
+	 * `apply` is storage's commit — the record's own write group's where storage offers one
+	 * ({@link applyConsensusCommits}), a lone call otherwise — so this method is the same either way.
+	 *
+	 * NOTE: the behind-reconcile below lands its block through `saveReplicatedBlock`, which runs its
+	 * own strict write group and flush INSIDE the record's group when there is one. That flush covers
+	 * the group's earlier writes too (rule 4 of the flush contract), so it hastens their sync; left as
+	 * it is because the reconcile is the rare path and nesting it in the outer group buys nothing.
 	 */
-	private async applyCommitToStorage(record: ClusterRecord, commit: CommitRequest, proof: BlockCommitProof | undefined): Promise<{ applied: CommitResult; behind: boolean }> {
+	private async applyCommitToStorage(
+		apply: (request: CommitRequest) => Promise<CommitResult>, record: ClusterRecord, commit: CommitRequest
+	): Promise<{ applied: CommitResult; behind: boolean }> {
 		const messageHash = record.messageHash;
 		let result: CommitResult;
 		try {
-			result = await this.localApply().commit(commit, undefined, { proof, syncWithinMs: this.syncWindowFor(record) });
+			result = await apply(commit);
 		} catch (err) {
 			// `StorageRepo.commit` throws (rather than returning success:false) when
 			// the pending action is missing — the canonical "behind" signal: this

@@ -538,21 +538,45 @@ same location (`runRawStorageConformance` in
 **Who calls `flush()`.** Exactly once at the end of every group of writes whose outcome the
 node is about to report to another machine:
 
-- `StorageRepo` ends each write group through `endGroup` in
-  `packages/db-p2p/src/storage/storage-repo.ts`: `pend`, `commit`, `cancel`, `recoverBlock`,
-  `saveReplicatedBlock`, and a `get` that entered a block write latch (a read-driven
-  promotion, or a coverage restore). The flush runs after the group's latches are released,
+- `StorageRepo` ends each write group with one flush, in
+  `packages/db-p2p/src/storage/storage-repo.ts`: `cancel`, `recoverBlock`,
+  `saveReplicatedBlock`, `deleteReleasedBlock` and a `get` that entered a block write latch (a
+  read-driven promotion, or a coverage restore) through `endGroup`, and `pend` and `commit`
+  through `applyInOneGroup`. The flush runs after the group's latches are released,
   so a concurrent group on the same blocks is not held behind the disk and several groups can
   share one sync, and before the group's change events. A group whose work throws is flushed
   before the error propagates, strictly whatever window it was given, and one fanned out per
   block (`get`, `cancel`) first waits for every block to settle, so the flush covers a sibling
   block still writing when another failed; a flush that rejects after the work returned makes
   the call throw and emit nothing. A `get` that took no latch does not flush, so the plain
-  read path costs nothing extra.
+  read path costs nothing extra, and neither does a `pend` the validation hook refused, which
+  reaches no block's latches.
+
+  **One group may span several applies of one consensus record.** A write over several
+  collections travels as one pend record and one commit record, each carrying one operation per
+  collection, and a machine applying such a record would otherwise flush once per collection —
+  2N flushes for N collections where the record allows 2. `applyInOneGroup`
+  (`ILocalApply.applyInOneGroup`) is the group a caller runs its whole loop inside: every `pend`
+  or `commit` the loop makes takes and releases its own request's block latches exactly as a lone
+  call does, the group flushes ONCE when the loop is done, and each request's post-flush steps —
+  the pend group note, the HLC `stored` mark, the collection change events — run after that
+  flush, in request order. `pend` and `commit` are groups of one through the same path, so a lone
+  apply and a batched one share one implementation. The four callers are
+  `CoordinatorRepo.applyPendsInOrder`, `CoordinatorRepo.applyCommitsInOrder` (its solo commit),
+  `CoordinatorRepo.applyCommitsAfterConsensus` (its fallback commit) and
+  `ClusterMember.applyConsensusPends` / `applyConsensusCommits`; each keeps its own control flow
+  (the coordinator stops at the first refusal, the member applies every operation and reconciles
+  its own divergences), so only the flush and the deferred steps move. The method is optional on
+  the `ILocalApply` seam and callers probe for it: a repo without it — a plain `IRepo` test double
+  — keeps one flush per request. A behind-reconcile a member's commit triggers lands its block
+  through `saveReplicatedBlock`, whose own strict flush runs inside the record's group and so
+  hastens the group's earlier writes; that is the rare path and is left as it is.
 
   Which groups carry a window. `pend` and `commit` take a third argument, `StorageApplyOptions`
   in `packages/db-p2p/src/storage/storage-repo.ts`, whose `syncWithinMs` is the group's
-  `withinMs`; absent, the group is strict. A node passes a window only for an apply that runs
+  `withinMs`; absent, the group is strict. One group, one window: a record's collections all
+  carry the window the record's cohort allows, which they did individually before they shared a
+  group. A node passes a window only for an apply that runs
   on a consensus record — `ClusterMember.applyConsensusOperations` for the pend and commit of
   every record it applies, and `CoordinatorRepo` for its own fallback pend and commit after
   consensus ran without its member — and the window is `durabilityWindowMs` in
@@ -590,7 +614,10 @@ is consensus-decided content or a pending record, and what a crash takes back is
 later suffix of the resolved writes (rule 3): a vote built on a record's absence stays valid
 when the record is lost, and one built on its presence was a refusal. Likewise a second group
 on the same blocks can read the first's writes before they are durable and build on them;
-its own writes resolved later, so under rule 3 they cannot survive without the first's.
+its own writes resolved later, so under rule 3 they cannot survive without the first's. A group
+spanning a record's collections widens that span from one apply to the record's whole apply, on
+the same argument and with the same two exposures: consensus-decided content, and a pending
+record.
 
 A group flushed with a window stays visible longer: its change events fire when the flush
 resolves, which for a relaxed flush is once the writes survive a process crash, not a power

@@ -4105,6 +4105,72 @@ describe('StorageRepo — every write group ends with one flush (storage.md Inva
 		expect((thrown as Error | undefined)?.message).to.equal('bad block');
 		expect(trace).to.deep.equal(['good:setLatest', 'flush']);
 	});
+
+	/** One action over three collections, the shape `pendMany` / `commitMany` send as one record. */
+	const BATCH_BLOCKS = ['block-a', 'block-b', 'block-c'];
+
+	const batchPend = (blockId: string, collectionId: string): PendRequest => ({
+		actionId: 'a1' as ActionId,
+		transforms: makeInsertTransforms(blockId as BlockId, makeBlockInCollection(blockId, collectionId)),
+		policy: 'c'
+	});
+
+	const batchCommit = (blockId: string) => ({
+		actionId: 'a1' as ActionId, blockIds: [blockId as BlockId], tailId: blockId as BlockId, rev: 1
+	});
+
+	it('a record of three collections pends and commits under one flush each, announcing after the commit group flush', async () => {
+		const trace: string[] = [];
+		const { store } = makeTracedStore(trace);
+		const repo = new StorageRepo(store);
+		BATCH_BLOCKS.forEach((blockId, index) => {
+			repo.onCollectionChange(`collection-${index}` as BlockId, () => trace.push(`event:${blockId}`));
+		});
+
+		await repo.applyInOneGroup({}, async group => {
+			for (const [index, blockId] of BATCH_BLOCKS.entries()) {
+				expect((await group.pend(batchPend(blockId, `collection-${index}`))).success).to.equal(true);
+			}
+		});
+		expect(trace, 'three pends of one record share one flush').to.deep.equal(['flush']);
+
+		trace.length = 0;
+		await repo.applyInOneGroup({}, async group => {
+			for (const blockId of BATCH_BLOCKS) {
+				expect((await group.commit(batchCommit(blockId))).success).to.equal(true);
+			}
+		});
+		// Every collection has landed by the time the first event fires, so each one's change hold
+		// finds the action's other pend groups already closed and releases at once.
+		expect(trace, 'one flush for the record, every collection announced after it')
+			.to.deep.equal(['flush', 'event:block-a', 'event:block-b', 'event:block-c']);
+	});
+
+	it('a group whose second commit throws flushes once and still announces the first collection', async () => {
+		const trace: string[] = [];
+		const { store } = makeTracedStore(trace);
+		const repo = new StorageRepo(store);
+		repo.onCollectionChange('collection-0' as BlockId, () => trace.push('event:block-a'));
+
+		// Only `block-a` is pended, so the group's second commit throws the missing-pend error.
+		await repo.applyInOneGroup({}, async group => {
+			expect((await group.pend(batchPend('block-a', 'collection-0'))).success).to.equal(true);
+		});
+
+		trace.length = 0;
+		let thrown: unknown;
+		try {
+			await repo.applyInOneGroup({}, async group => {
+				expect((await group.commit(batchCommit('block-a'))).success).to.equal(true);
+				await group.commit(batchCommit('block-b'));
+			});
+		} catch (err) {
+			thrown = err;
+		}
+		expect((thrown as Error | undefined)?.message).to.contain('Pending action a1 not found');
+		expect(trace, 'the fault is flushed strictly, and what landed before it still announces')
+			.to.deep.equal(['flush', 'event:block-a']);
+	});
 });
 
 describe('StorageRepo — a commit applied with a window is reported before it is power-loss durable (storage.md Invariant 6)', () => {

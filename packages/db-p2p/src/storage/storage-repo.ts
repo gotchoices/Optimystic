@@ -313,13 +313,40 @@ export interface StorageApplyOptions {
  * same reason as {@link ICommitDigestPreviewer}: one definition of the widened contract, and
  * something a repo decorator can `implements` and forward. `IRepo.pend` and `IRepo.commit` take
  * two arguments; the third is harmless at runtime for a plain `IRepo` implementation (the extra
- * argument is ignored), so callers cast rather than structurally probe — but a decorator that
- * narrows back to `IRepo` silently stops persisting proofs, and silently makes every apply strict,
- * on that node.
+ * argument is ignored), so callers cast rather than structurally probe for those two — but a
+ * decorator that narrows back to `IRepo` silently stops persisting proofs, and silently makes
+ * every apply strict, on that node.
+ *
+ * {@link applyInOneGroup} is the one member callers MUST probe for: it is optional so a plain
+ * `IRepo` test double needs no group, and a caller that finds it absent falls back to one call —
+ * and so one flush — per request.
  */
 export interface ILocalApply {
 	pend(request: PendRequest, options?: MessageOptions, apply?: StorageApplyOptions): Promise<PendResult>;
 	commit(request: CommitRequest, options?: MessageOptions, apply?: StorageApplyOptions): Promise<CommitResult>;
+	/**
+	 * Run `body` as ONE write group: every pend or commit it makes through `group` writes under that
+	 * request's own block latches exactly as a lone call does, but the group flushes once, with
+	 * `apply`'s window, after `body` settles; the post-flush steps of every request that got that far
+	 * (the pend group note, the HLC `stored` mark, the collection change events) run after that
+	 * flush, in request order. For the several collections of ONE consensus record, whose pends — or
+	 * whose commits — would otherwise cost one flush each. See {@link StorageRepo.applyInOneGroup}.
+	 */
+	applyInOneGroup?<T>(apply: Pick<StorageApplyOptions, 'syncWithinMs'>, body: (group: LocalApplyGroup) => Promise<T>): Promise<T>;
+}
+
+/**
+ * The pend/commit handle {@link ILocalApply.applyInOneGroup} hands its body: the same two applies,
+ * minus the group-level flush window, plus a commit's own proof. A callback handle rather than a
+ * `pendMany(requests)` on storage because the callers' loops differ and must keep their own control
+ * flow — the coordinator stops at the first refusal, the member applies every operation and handles
+ * each one's divergence and behind-reconcile itself — so only the flush and the deferred post-flush
+ * steps move into the group.
+ */
+export interface LocalApplyGroup {
+	pend(request: PendRequest, options?: MessageOptions): Promise<PendResult>;
+	/** `options` is accepted for symmetry with {@link ILocalApply.commit} and, like it, read by nothing: a commit takes no fact about its writer. */
+	commit(request: CommitRequest, options?: MessageOptions, proof?: BlockCommitProof): Promise<CommitResult>;
 }
 
 /**
@@ -336,9 +363,25 @@ export interface IDurableStorage {
 const alwaysWrote = (): boolean => true;
 
 /** The flush a `pend` or `commit` group ends with: the caller's window, strict when none was given. */
-function groupFlush(apply: StorageApplyOptions | undefined): FlushOptions {
+function groupFlush(apply: Pick<StorageApplyOptions, 'syncWithinMs'> | undefined): FlushOptions {
 	return { withinMs: apply?.syncWithinMs ?? 0 };
 }
+
+/**
+ * What one apply inside an {@link StorageRepo.applyInOneGroup} group leaves for after the group's
+ * flush: a pend's group note and HLC `stored` mark, or a commit's change emission. Collected in
+ * request order while the group runs and drained once the flush has resolved, so nothing a request
+ * reports as landed is acted on before it is durable.
+ */
+type PostFlushStep = () => void | Promise<void>;
+
+/**
+ * One {@link StorageRepo.applyInOneGroup} group's accumulating state. `wrote` is `endGroup`'s
+ * `wrote` for a group of several applies: true once any of them entered its request's latches, so a
+ * group whose every apply was refused before that — a pend the validation hook rejected, which
+ * returned before the group existed — still flushes nothing.
+ */
+type ApplyGroupState = { wrote: boolean, afterFlush: PostFlushStep[] };
 
 /**
  * The capability that answers "which action committed revision N of this block?" — the question the
@@ -811,34 +854,28 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	}
 
 	/**
-	 * Run one write group's latched work, then flush it before the caller reports or emits.
-	 * Every method here that writes block storage — `pend`, `commit`, `cancel`, `recoverBlock`,
-	 * `saveReplicatedBlock`, and a `get` that entered a write latch — ends through this, so each call
-	 * flushes the store exactly once, after `work` has released its latches: a concurrent group on the
-	 * same blocks is not held behind the disk, and several groups can share one sync (rule 4 of the
-	 * flush contract on `RawStoreDriver.flush`).
+	 * Run one STRICT write group's latched work, then flush it before the caller reports or emits.
+	 * `cancel`, `recoverBlock`, `saveReplicatedBlock`, `deleteReleasedBlock` and a `get` that entered
+	 * a write latch end through this, so each call flushes the store exactly once, after `work` has
+	 * released its latches: a concurrent group on the same blocks is not held behind the disk, and
+	 * several groups can share one sync (rule 4 of the flush contract on `RawStoreDriver.flush`).
 	 *
-	 * `flush` is the group's deadline. Strict — absent, or `withinMs` 0 — means the writes survive
-	 * every crash the store names before this resolves, so nothing announces a commit this node could
-	 * still lose. Relaxed means they survive a process crash now and a power cut only once the window
-	 * has passed, while the change events still fire when this resolves: within the window a power
-	 * cut can take back a write this node announced and reported held, which is the accepted risk
-	 * the durability window's loss target prices (`durabilityWindowMs` in `./durability-window.ts`).
-	 * Only `pend` and `commit` pass a window, and only when their caller gave one. A deferred sync
-	 * that fails latches the store: the next group on this node fails and is logged, but the writer
-	 * answered inside the window was already told the write landed — the same accepted risk.
+	 * Strict means the writes survive every crash the store names before this resolves, so nothing
+	 * announces a write this node could still lose. `pend` and `commit` go through
+	 * {@link applyInOneGroup} instead, which is the one group that may carry the caller's window and
+	 * the one that may span several applies.
 	 *
-	 * A throwing `work` is flushed too, strictly whatever `flush` says, since whatever landed before
-	 * the fault must be durable before anyone acts on the failure; the original error is rethrown and
-	 * a flush error behind it is only logged. When `work` returned, a rejected flush propagates: the
-	 * caller reports nothing, and the store refuses later writes until reopened (rule 5), so a retry
-	 * cannot report success over writes that may be gone.
+	 * A throwing `work` is flushed too, since whatever landed before the fault must be durable before
+	 * anyone acts on the failure; the original error is rethrown and a flush error behind it is only
+	 * logged. When `work` returned, a rejected flush propagates: the caller reports nothing, and the
+	 * store refuses later writes until reopened (rule 5), so a retry cannot report success over
+	 * writes that may be gone.
 	 *
 	 * `wrote` lets the hot read path skip the flush when it took no latch; every other group flushes
 	 * on every exit, refusals included, because an extra flush costs latency and a missed one costs
 	 * durability.
 	 */
-	private async endGroup<T>(work: () => Promise<T>, wrote: () => boolean = alwaysWrote, flush?: FlushOptions): Promise<T> {
+	private async endGroup<T>(work: () => Promise<T>, wrote: () => boolean = alwaysWrote): Promise<T> {
 		let result: T;
 		try {
 			result = await work();
@@ -849,15 +886,15 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 			throw err;
 		}
 		if (wrote()) {
-			await this.storage.flush(flush);
+			await this.storage.flush();
 		}
 		return result;
 	}
 
 	/**
-	 * {@link endGroup}'s flush after a fault: the fault is what the caller must see, so a flush error
-	 * is logged, not thrown. Always strict: a group that threw is reported as a failure, and what
-	 * landed before the throw is synced before anyone acts on it.
+	 * The flush {@link endGroup} and {@link applyInOneGroup} make after a fault: the fault is what the
+	 * caller must see, so a flush error is logged, not thrown. Always strict: a group that threw is
+	 * reported as a failure, and what landed before the throw is synced before anyone acts on it.
 	 */
 	private async flushBehindFault(fault: unknown): Promise<void> {
 		try {
@@ -1231,6 +1268,16 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	}
 
 	async pend(request: PendRequest, options?: MessageOptions, apply?: StorageApplyOptions): Promise<PendResult> {
+		return await this.applyInOneGroup(apply ?? {}, group => group.pend(request, options));
+	}
+
+	/**
+	 * One pend inside a write group: validate, write under the request's block latches, and leave the
+	 * group note and the HLC `stored` mark for after the group's flush. The validation runs here —
+	 * inside the group but OUTSIDE the request's latches — because it can call the caller's hook, and
+	 * no caller-supplied code may enter a latch hold (see {@link pendUnderLatches}).
+	 */
+	private async pendInGroup(request: PendRequest, options: MessageOptions | undefined, state: ApplyGroupState): Promise<PendResult> {
 		const hlc = this.pendHlcs?.receive(request);
 		// The records of a pend the writer marked as its own (`MessageOptions.localWriter`, set only by
 		// the transactor running in this process, never by a remote writer) are stamped with this run,
@@ -1253,17 +1300,20 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 			return validationRefusal(validation);
 		}
 
-		const { result, saved } = await this.endGroup(() => this.pendUnderLatches(request, localRun), alwaysWrote, groupFlush(apply));
+		state.wrote = true;
+		const { result, saved } = await this.pendUnderLatches(request, localRun);
 		if (result.success) {
-			this.notePendGroup(request.actionId, saved);
-			if (hlc !== undefined) this.pendHlcs?.stored(hlc);
+			state.afterFlush.push(() => {
+				this.notePendGroup(request.actionId, saved);
+				if (hlc !== undefined) this.pendHlcs?.stored(hlc);
+			});
 		}
 		return result;
 	}
 
 	/**
-	 * {@link pend}'s write group: classify every block, then save, under one hold of their write
-	 * latches. Returns the result to report and `saved`, the blocks pass 2 wrote a pending record for —
+	 * {@link pendInGroup}'s latched body: classify every block, then save, under one hold of their
+	 * write latches. Returns the result to report and `saved`, the blocks pass 2 wrote a pending record for —
 	 * the action's pend group here (see {@link notePendGroup}); empty on every refusal.
 	 *
 	 * `localRun` is this repo's {@link runId} when the pend is the in-process writer's own
@@ -1322,7 +1372,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		// `acquireBlockWriteLatches` (deduped, sorted) is what keeps the three multi-latch holders —
 		// this, `commit`, and `applyInvalidation` — free of deadlock, and no caller of `pend`
 		// (`ClusterRepo`, `CoordinatorRepo`, `service.ts`) holds a block latch, so the hold cannot
-		// re-enter itself.
+		// re-enter itself. An `applyInOneGroup` body is caller-supplied code that runs BETWEEN holds,
+		// never inside one: the hold is taken and released within each `group.pend` / `group.commit`.
 		//
 		// NOTE: a pend now blocks concurrent commits on its blocks for the span of BOTH passes, not
 		// just its writes. Accepted: every call inside is local storage I/O, and `commit` already
@@ -1575,21 +1626,103 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 * divergence split above.
 	 */
 	async commit(request: CommitRequest, _options?: MessageOptions, apply?: StorageApplyOptions): Promise<CommitResult> {
+		return await this.applyInOneGroup(apply ?? {}, group => group.commit(request, undefined, apply?.proof));
+	}
+
+	/**
+	 * One commit inside a write group: write under the request's block latches, and leave the change
+	 * emission for after the group's flush — for every block newly committed here, including those
+	 * that landed before a mid-loop failure (alreadyDone / stale partitions never reach
+	 * `collectionBlocks`). Queued whatever the result, since a refusal can still have landed blocks
+	 * (the Option A emission guarantee); nothing is queued when {@link commitUnderLatches} throws,
+	 * which is also what happened before the group existed.
+	 */
+	private async commitInGroup(request: CommitRequest, proof: BlockCommitProof | undefined, state: ApplyGroupState): Promise<CommitResult> {
 		log('commit actionId=%s rev=%d blockIds=%d', request.actionId, request.rev, request.blockIds.length);
-		const { result, collectionBlocks } = await this.endGroup(() => this.commitUnderLatches(request, apply?.proof), alwaysWrote, groupFlush(apply));
-		// Notify after the critical section and the group's flush — relaxed when `apply` gave a window,
-		// see `endGroup` — for every block newly committed here, including those that landed before a
-		// mid-loop failure (alreadyDone / stale partitions never reach `collectionBlocks`). Awaited: on
-		// the one path that reads storage (another collection of the action still pending here) the
-		// reads are local and unlatched, and the commit still returns with its events dispatched or held.
-		await this.emitCollectionChanges(collectionBlocks, request.actionId, request.rev, request.tailId);
+		state.wrote = true;
+		const { result, collectionBlocks } = await this.commitUnderLatches(request, proof);
+		// Awaited when it runs: on the one path that reads storage (another collection of the action
+		// still pending here) the reads are local and unlatched, and the commit still returns with its
+		// events dispatched or held.
+		state.afterFlush.push(() => this.emitCollectionChanges(collectionBlocks, request.actionId, request.rev, request.tailId));
 		return result;
 	}
 
 	/**
-	 * {@link commit}'s write group, under the write latches of every block in the batch. Returns the
-	 * result to report and the blocks newly committed here, grouped by collection, which the caller
-	 * emits once the group is durable.
+	 * See {@link ILocalApply.applyInOneGroup}: run `body` as one write group over several local
+	 * applies of ONE consensus record. Each `group.pend` / `group.commit` takes and releases its own
+	 * request's block latches in turn, exactly as a lone call does — the latches are never held across
+	 * requests, so no new lock ordering appears — and then the group flushes ONCE, with `apply`'s
+	 * window, and the requests' post-flush steps run in request order. Between a request's latch
+	 * release and that flush a concurrent reader can see a write that is not yet durable: the same
+	 * window a lone `pend` or `commit` has between its latched body and its flush (*Visible before
+	 * durable* in `../docs/storage.md` §6), now shared by the record's collections.
+	 *
+	 * `pend` and `commit` are groups of one through here, so there is one code path for a lone apply
+	 * and a batched one. A record of N collections costs 2 flushes instead of 2N.
+	 *
+	 * A throwing `body` is flushed too — strictly, as {@link flushBehindFault} does — and the steps of
+	 * the requests that landed before the throw still run, so a block that durably committed still
+	 * emits; the body's error is then rethrown.
+	 *
+	 * A group no apply of which reached its request's latches flushes nothing, which is `endGroup`'s
+	 * `wrote` rule: a lone pend the validation hook refused answered before any group existed, and
+	 * must not start paying for a sync now that it is a group of one.
+	 *
+	 * The change hold ({@link emitCollectionChanges}) sees a batch rather than a sequence: every
+	 * collection of a batched commit has landed by the time the first emission runs, so each one's
+	 * hold finds the action's other groups already closed and releases at once — the same wakes as
+	 * before, with no hold. A batched pend notes its groups after the flush instead of after each
+	 * request, which is still before any commit of the action can reach this node (the commit record
+	 * follows the pend record's answer).
+	 */
+	async applyInOneGroup<T>(apply: Pick<StorageApplyOptions, 'syncWithinMs'>, body: (group: LocalApplyGroup) => Promise<T>): Promise<T> {
+		const state: ApplyGroupState = { wrote: false, afterFlush: [] };
+		const group: LocalApplyGroup = {
+			pend: (request, options) => this.pendInGroup(request, options, state),
+			commit: (request, _options, proof) => this.commitInGroup(request, proof, state)
+		};
+		let result: T;
+		try {
+			result = await body(group);
+		} catch (err) {
+			if (state.wrote) {
+				await this.flushBehindFault(err);
+			}
+			await this.runPostFlush(state.afterFlush, true);
+			throw err;
+		}
+		if (state.wrote) {
+			await this.storage.flush(groupFlush(apply));
+		}
+		await this.runPostFlush(state.afterFlush, false);
+		return result;
+	}
+
+	/**
+	 * Drain a group's collected post-flush steps, in request order. None is expected to throw — a
+	 * commit's emission isolates its listeners and swallows its one storage read's faults — and
+	 * `behindFault` says what to do if one does: on the normal path the throw is the caller's answer,
+	 * exactly as a lone `commit`'s emission throw was; behind a fault it is logged instead, because
+	 * the fault is what the caller must see and the remaining requests' events must still fire.
+	 */
+	private async runPostFlush(steps: readonly PostFlushStep[], behindFault: boolean): Promise<void> {
+		for (const step of steps) {
+			try {
+				await step();
+			} catch (err) {
+				if (!behindFault) {
+					throw err;
+				}
+				log('group:post-flush-step-failed-after-fault error=%s', err instanceof Error ? err.message : String(err));
+			}
+		}
+	}
+
+	/**
+	 * {@link commitInGroup}'s latched body, under the write latches of every block in the batch.
+	 * Returns the result to report and the blocks newly committed here, grouped by collection, which
+	 * the caller emits once the group is durable.
 	 */
 	private async commitUnderLatches(
 		request: CommitRequest,

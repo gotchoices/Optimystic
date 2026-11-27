@@ -1188,7 +1188,7 @@ Collection.sync()
             → StorageRepo.pend/commit  # Applies to local storage, the log tail first
 ```
 
-Each storage apply (`StorageRepo.pend` / `commit`) ends with one flush of the node's store, with the window its cohort allows (strict for a solo write), after its block latches are released and before its change events fire — see [packages/db-p2p/docs/storage.md §6](../packages/db-p2p/docs/storage.md#6-a-write-survives-a-crash-once-a-flush-called-after-it-has-resolved).
+A consensus record's storage applies (`StorageRepo.pend` / `commit`) end with one flush of the node's store between them — one for the record's pends, one for its commits, however many collections it covers — with the window its cohort allows (strict for a solo write), after each request's block latches are released and before any of their change events fire. The caller runs its whole apply loop inside one write group (`StorageRepo.applyInOneGroup`) to get that; see [packages/db-p2p/docs/storage.md §6](../packages/db-p2p/docs/storage.md#6-a-write-survives-a-crash-once-a-flush-called-after-it-has-resolved).
 
 The `WriteDurability` each layer assembles on the way back up returns along this same path, unflattened: `TransactorSource.transact` hands the whole `CommitResult` to `Collection.syncAttempts`, which reports the committing attempt's class out of `sync`/`updateAndSync`, and `Tree`/`Diary` forward it. `undefined` from a sync means nothing was staged, so nothing was written — not that the write failed. Every answer that confirms a commit also names the blocks it committed, each at the revision it committed at (`WriteDurability.blockRevs`): the full-replication event (`BlockDurabilityReachedEvent` in `packages/db-core/src/transactor/change-notifier.ts`) is keyed by block and revision, not by action, so this is what a host matches the events against. It is stamped client-side where the commit is confirmed — `TransactorSource.transact`, `TransactionCoordinator`'s per-collection commit, and `Collection.settleUnfinished` when it finds a superseded write saved — through `withBlockRevs` in `packages/db-core/src/network/durability.ts`, so it never travels on the wire, and it never names a `torn` block; merging two answers keeps the higher revision per block. A commit spanning several collections, `TransactionCoordinator.commit` (and `TransactionSession.commit`, as `ExecutionResult.durability`), answers with a `TransactionDurability` (`packages/db-core/src/transaction/durability.ts`): each collection it wrote, across every attempt, with its own class, and `overall`, the weakest of them, so a caller reading only `overall` is reading the binding constraint. A collection the refresh between attempts saved without learning who holds it is listed with an `undefined` class, and `overall` is then absent rather than fabricated — show such a transaction as pending. `undefined` from the commit means the same as from a sync: nothing was written. A commit that fails after something landed throws `CoordinatorPartialCommitError`, whose `durability` describes exactly the committed half.
 
@@ -1762,8 +1762,10 @@ funnel for both the coordinated and direct paths, so it originates a per-collect
 StorageRepo.commit()                       # critical section (block locks held)
   → internalCommit() returns collectionId  # newBlock.header ?? priorBlock.header (delete)
   → release locks (finally)
-  → storage.flush()                        # strict, or with the cohort's window on a consensus apply (storage.md §6)
-  → emitCollectionChanges()                # one CollectionChangeEvent per distinct collection
+  → storage.flush()                        # once per consensus record, not per collection; strict,
+                                           #   or with the cohort's window on a consensus apply (storage.md §6)
+  → emitCollectionChanges()                # one CollectionChangeEvent per distinct collection,
+                                           #   for every commit the group ran, in request order
 StorageRepo.get()                          # read-driven promotion (context proves committed)
   → internalCommit() returns collectionId  # promotes a pending action that landed durably
   → storage.flush()                        # only when the read took a write latch
@@ -1815,7 +1817,11 @@ StorageRepo.get()                          # read-driven promotion (context prov
   `StorageRepo`. What it costs: a single-collection action has one group, which its own commit
   closes by landing — no storage read, no delay, no timer. After a write group of a
   multi-collection action ends with groups still open, each open group costs one unlatched read
-  of a pending record. A held event is released at the latest `changeHoldMs` after it was first
+  of a pending record. An action whose collections travel as ONE commit record is applied inside
+  one write group, whose change events all fire after its single flush, so by then every
+  collection has landed and each event's hold finds the action's other groups already closed and
+  releases at once: the same wakes, with no hold and no read. A hold still does its work where the
+  collections travel as separate records, which is the case it was built for. A held event is released at the latest `changeHoldMs` after it was first
   held (`StorageRepoOptions.changeHoldMs`, default `DEFAULT_CHANGE_HOLD_MS`, 10 s; `0` disables
   the hold), through one unref'd timer per action, so a writer that died between its commits
   costs a late wake rather than one that never comes. In memory only, capped (an evicted action's
