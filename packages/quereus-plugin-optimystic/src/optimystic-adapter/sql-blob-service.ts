@@ -223,7 +223,9 @@ export class SqlBlobService implements SqlBlobBackendService {
 	 * @param explicitOwner The caller's own `owner`, when it gave one: that pin is the host's to
 	 *   release, so nothing is defaulted and nothing is recorded on any transaction.
 	 * @param backendOf The backend whose key a recorded put is noted under. A function, and called
-	 *   only after the label is chosen, because resolving it may await — see above.
+	 *   only after the label is chosen, because resolving it may await — see above. It must name the
+	 *   backend `store` actually writes into: the key is what `SqlBlobPins` reopens the store through
+	 *   to release the pin, so one naming another network's store would release nothing.
 	 * @param store Stores the bytes, under the owner label this chose.
 	 */
 	private async pinnedPut(
