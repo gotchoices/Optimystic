@@ -16,7 +16,7 @@ import { emptyWriteFacts, freshElementsOf, insertAcceptsEqualRow, rewriteAccepts
 import { emptyBlobReferenceLedger } from './optimystic-adapter/blob-reference-ledger.js';
 import { isReplaying } from './transaction/replay-scope.js';
 import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData, TransactionState } from './types.js';
-import type { NodeStorage } from '@optimystic/db-p2p';
+import type { BlobPathMode, NodeStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
 import { ConflictResolution, IndexConstraintOp, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, combineConjunctive, decodeIdxStr, equalitySeekKeyCount, equalityServesKeyColumn, rangeServesKeyColumn, shiftSchemaIndicesForDrop } from '@quereus/quereus';
 import type { VirtualTableModule, BaseModuleConfig, ColumnSchema, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, IndexDescriptor, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, TableWrite, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo, ModuleCostProfile, PredicateConstraint } from '@quereus/quereus';
@@ -662,7 +662,7 @@ export function defaultTransactorOf(aux: Readonly<Record<string, unknown>>): str
 function resolveBinding(
   args: Readonly<Record<string, SqlValue>>,
   aux: Readonly<Record<string, unknown>>,
-): Pick<ParsedOptimysticOptions, 'transactor' | 'keyNetwork' | 'libp2pOptions' | 'storageFactory'> {
+): Pick<ParsedOptimysticOptions, 'transactor' | 'keyNetwork' | 'libp2pOptions' | 'storageFactory' | 'blobPaths'> {
   const transactor = (args['transactor'] as string) || defaultTransactorOf(aux);
   const keyNetwork = (args['keyNetwork'] as string) || (aux['default_key_network'] as string) || 'libp2p';
   const port = typeof args['port'] === 'number' ? args['port'] : (typeof aux['default_port'] === 'number' ? aux['default_port'] as number : 0);
@@ -686,7 +686,32 @@ function resolveBinding(
       storageAllotment: declaredStorageAllotment(aux),
     },
     storageFactory,
+    blobPaths: declaredBlobPaths(aux),
   };
+}
+
+/** The three modes `blob_paths` accepts, as the setting and its error message list them. */
+const BLOB_PATH_MODES = ['off', 'verify', 'trust'] satisfies BlobPathMode[];
+
+/**
+ * The plugin-level `blob_paths` (the `paths` of the blob service a network's blobs go through), or
+ * `undefined` when unset — which is what `'off'` also means downstream, since both services apply
+ * `init.paths ?? 'off'`. `null` and `''` count as unset for the reason they do for `cost_profile`
+ * and `blob_unstaged_holding_ms`: a plugin loader's settings form sends an untouched field as `''`.
+ *
+ * Anything else throws, naming the setting and all three modes, because a host that asked for path
+ * access and got `undefined` back from `SqlBlobService.pathAccess()` cannot otherwise tell which of
+ * the reasons it got — a mistyped mode, a store that cannot reach files, or a host-registered node.
+ * A mode the STORE cannot honour is not refused here and never fails anything: `LocalBlobService`
+ * resolves the mode and the store together and logs one `blob:paths mode=… available=…` line.
+ */
+export function declaredBlobPaths(aux: Readonly<Record<string, unknown>>): BlobPathMode | undefined {
+  const declared = aux['blob_paths'];
+  if (declared === undefined || declared === null || declared === '') return undefined;
+  if (typeof declared === 'string' && (BLOB_PATH_MODES as readonly string[]).includes(declared)) {
+    return declared as BlobPathMode;
+  }
+  throw new Error(`blob_paths must be one of ${quotedKeyList(BLOB_PATH_MODES)}; got ${typeof declared} ${String(declared)}`);
 }
 
 /**

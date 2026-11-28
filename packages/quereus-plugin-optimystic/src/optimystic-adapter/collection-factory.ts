@@ -555,9 +555,18 @@ export class CollectionFactory {
     // configuration working as intended; a node that carries no blob service is a host-injected one
     // that cannot hold blobs for its network.
     const reason = nodeInfo === undefined ? 'transactor-has-no-node' : 'node-without-blobs';
-    const service = new SingleMachineBlobService(
-      this.storageFor(options) ?? { pieces: new MemoryPieceStore(), kv: new MemoryKVStore() },
-    );
+    // The two stores this service needs, named explicitly rather than handing the whole `NodeStorage`
+    // through as the init: the init also carries settings of its own (`paths`), and a `NodeStorage`
+    // spread in would have silently stopped carrying them the next time either type gained a field.
+    const storage = this.storageFor(options);
+    const service = new SingleMachineBlobService({
+      pieces: storage?.pieces ?? new MemoryPieceStore(),
+      kv: storage?.kv ?? new MemoryKVStore(),
+      // The plugin-level `blob_paths`, so a host with no libp2p node at all — a phone on local
+      // storage — can still put and read blobs by file path. Only asks: a store whose pieces cannot
+      // reach files answers no path access and logs that it did (`LocalBlobService.pathAccess`).
+      paths: options.blobPaths,
+    });
     service.start();
     this.singleMachineBlobServices.add(service);
     blobLog('blob:backend-single-machine key=%s reason=%s', key, reason);
@@ -700,6 +709,12 @@ export class CollectionFactory {
         linkRoundTripMs: options.libp2pOptions?.linkRoundTripMs,
         cohortTopic: options.libp2pOptions?.cohortTopic,
         storageAllotment: options.libp2pOptions?.storageAllotment,
+        // Unconditional, and equivalent to passing no `blobs` at all when `blobPaths` is unset:
+        // every sub-option the node reads off `blobs` has its own `?? default` (`hold`,
+        // `copy.enabled`, `cacheBudgetBytes`, `reclaimGraceMs`, `digest`), so an object carrying
+        // only `paths: undefined` changes nothing about the node. Do not "fix" this into a
+        // conditional spread.
+        blobs: { paths: options.blobPaths },
         fretProfile: 'edge',
         clusterSize: 1,
         clusterPolicy: {

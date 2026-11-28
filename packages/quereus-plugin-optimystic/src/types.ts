@@ -1,6 +1,6 @@
 import type { Libp2p } from '@libp2p/interface';
 import type { ITransactor } from '@optimystic/db-core';
-import type { NodeOptions, NodeStorage } from '@optimystic/db-p2p';
+import type { BlobPathMode, NodeOptions, NodeStorage } from '@optimystic/db-p2p';
 import type { BlobReferenceLedger } from './optimystic-adapter/blob-reference-ledger.js';
 import type { TransactionWriteFacts } from './optimystic-adapter/write-description.js';
 
@@ -52,6 +52,28 @@ export interface OptimysticOptions {
    * outside `register()` and returns them from here.
    */
   storageFactory?: () => NodeStorage;
+
+  /**
+   * Whether this network's blobs can be put straight from a file and read straight out to one, and
+   * how the piece ids a store's own file import produced are checked (docs/blobs.md §Putting and
+   * reading by file path): `'verify'` re-hashes every leaf the store imported, `'trust'` takes the
+   * store's ids as given, `'off'` (the default, and what unset means) offers no path access at all.
+   * Turning it on is what makes `SqlBlobService.pathAccess()` answer an object rather than
+   * `undefined`.
+   *
+   * Read by BOTH services a network's blobs can go through — the single-machine service every
+   * transactor without a libp2p node gets, and the node a `'network'` transactor builds (as its
+   * `NodeOptions.blobs.paths`) — which is why it sits here and not in {@link
+   * OptimysticOptions.libp2pOptions}. Inert on a node the HOST registered: that node carries
+   * whatever its builder asked for.
+   *
+   * It only ASKS. A store whose pieces cannot reach files (every browser store, the in-memory
+   * default, any store without `importFile`/`exportFile`) still answers no path access, logging one
+   * `blob:paths mode=… available=…` line; nothing throws. Set through the plugin-level `blob_paths`
+   * only, for the same reason as {@link LibP2PNodeOptions.linkRoundTripMs}: it configures one
+   * network's blob service, which every table on that network shares.
+   */
+  blobPaths?: BlobPathMode;
 }
 
 /**
@@ -112,6 +134,8 @@ export interface ParsedOptimysticOptions {
   cache: boolean;
   encoding: 'json' | 'msgpack';
   storageFactory?: () => NodeStorage;
+  /** {@link OptimysticOptions.blobPaths}. */
+  blobPaths?: BlobPathMode;
 }
 
 /**

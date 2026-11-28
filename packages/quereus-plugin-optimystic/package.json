@@ -148,6 +148,19 @@
         "help": "How long a blob put with no transaction open is kept when no statement ever references it. Unset keeps 24 hours. A blob any unfinished transaction references is never let go"
       },
       {
+        "key": "blob_paths",
+        "label": "Blob File Paths",
+        "type": "select",
+        "options": [
+          "",
+          "off",
+          "verify",
+          "trust"
+        ],
+        "default": "",
+        "help": "Whether blobs can be put straight from a file and read straight out to one. verify re-hashes what the store imported; trust takes the store's piece ids as given; off and empty offer no path access. Needs a storage whose piece store can reach files, or there is still none"
+      },
+      {
         "key": "cost_profile",
         "label": "Read Cost Profile",
         "type": "select",

@@ -14,7 +14,7 @@ import { MaterializedViewFollower } from './optimystic-adapter/materialized-view
 import { parseOfflineConfig } from './optimystic-adapter/offline-config.js';
 import { moduleCostProfile } from './optimystic-adapter/cost-profile.js';
 import type { CommitFullyHeldListener, SqlCommitDurabilityListener } from './optimystic-adapter/commit-durability.js';
-import { OptimysticModule, defaultTransactorOf } from './optimystic-module.js';
+import { OptimysticModule, declaredBlobPaths, defaultTransactorOf } from './optimystic-module.js';
 import { BLOBREF_TYPE } from './schema/blobref-type.js';
 import { createStampIdFunction } from './functions/transaction-id.js';
 import { createCommitOutlookFunction } from './functions/commit-outlook.js';
@@ -76,6 +76,12 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 	// (README § Plugin-Level Configuration). Read here, as `cost_profile` is, so a bad value throws
 	// before anything is built.
 	const unstagedHoldingMs = parseUnstagedHoldingMs(config);
+	// Whether this network's blobs can be put and read by file path (README § Plugin-Level
+	// Configuration). Read here purely so a mistyped mode throws before any node, store or table
+	// exists; `resolveBinding` reads the same key again to put the value on a binding's options. Both
+	// read THIS object — `auxData: config` below — so the value validated here is the value that
+	// arrives, the arrangement `defaultTransactorOf` already has.
+	declaredBlobPaths(config);
 
 	// Global factory instances
 	const collectionFactory = new CollectionFactory();
