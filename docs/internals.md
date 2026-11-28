@@ -1819,8 +1819,9 @@ StorageRepo.get()                          # read-driven promotion (context prov
   multi-collection action ends with groups still open, each open group costs one unlatched read
   of a pending record. An action whose collections travel as ONE commit record is applied inside
   one write group, whose change events all fire after its single flush, so by then every
-  collection has landed and each event's hold finds the action's other groups already closed and
-  releases at once: the same wakes, with no hold and no read. A hold still does its work where the
+  collection has landed: the first event's hold reads the action's other groups once, finds none
+  of them still pending, closes them all, and nothing is held — the same wakes as before, after
+  fewer reads than the sequence it replaces. A hold still does its work where the
   collections travel as separate records, which is the case it was built for. A held event is released at the latest `changeHoldMs` after it was first
   held (`StorageRepoOptions.changeHoldMs`, default `DEFAULT_CHANGE_HOLD_MS`, 10 s; `0` disables
   the hold), through one unref'd timer per action, so a writer that died between its commits

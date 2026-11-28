@@ -561,16 +561,27 @@ node is about to report to another machine:
   call does, the group flushes ONCE when the loop is done, and each request's post-flush steps —
   the pend group note, the HLC `stored` mark, the collection change events — run after that
   flush, in request order. `pend` and `commit` are groups of one through the same path, so a lone
-  apply and a batched one share one implementation. The four callers are
+  apply and a batched one share one implementation. The five callers are
   `CoordinatorRepo.applyPendsInOrder`, `CoordinatorRepo.applyCommitsInOrder` (its solo commit),
   `CoordinatorRepo.applyCommitsAfterConsensus` (its fallback commit) and
   `ClusterMember.applyConsensusPends` / `applyConsensusCommits`; each keeps its own control flow
   (the coordinator stops at the first refusal, the member applies every operation and reconciles
   its own divergences), so only the flush and the deferred steps move. The method is optional on
-  the `ILocalApply` seam and callers probe for it: a repo without it — a plain `IRepo` test double
-  — keeps one flush per request. A behind-reconcile a member's commit triggers lands its block
+  the `ILocalApply` seam, and the free function `applyAsOneGroup` in the same file is the one place
+  the absent case is written: a repo without the method — a plain `IRepo` test double — runs the
+  same loop body against a handle that forwards each request on its own, and so keeps one flush per
+  request. No caller probes for itself. A behind-reconcile a member's commit triggers lands its block
   through `saveReplicatedBlock`, whose own strict flush runs inside the record's group and so
   hastens the group's earlier writes; that is the rare path and is left as it is.
+
+  One consequence worth knowing: the group writes storage WITHOUT going through `pend` or `commit`,
+  so a wrapper put on either of those methods of a live `StorageRepo` — a spec's fault injection, a
+  gate that makes one collection's apply lag — is walked straight past on the batched path, and the
+  spec stops reproducing the fault it set up. Such a wrapper has to cover `applyInOneGroup` too;
+  `packages/db-p2p/test/support/intercept-commits.ts` does that for commits, and
+  `packages/quereus-plugin-optimystic/test/two-node-index-wake-consistency.spec.ts` does it for its
+  own gate. A repo DECORATOR is not exposed to this: it does not carry `applyInOneGroup`, so
+  `applyAsOneGroup` falls back to its own `pend` / `commit`.
 
   Which groups carry a window. `pend` and `commit` take a third argument, `StorageApplyOptions`
   in `packages/db-p2p/src/storage/storage-repo.ts`, whose `syncWithinMs` is the group's

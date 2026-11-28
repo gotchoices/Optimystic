@@ -317,9 +317,10 @@ export interface StorageApplyOptions {
  * decorator that narrows back to `IRepo` silently stops persisting proofs, and silently makes
  * every apply strict, on that node.
  *
- * {@link applyInOneGroup} is the one member callers MUST probe for: it is optional so a plain
- * `IRepo` test double needs no group, and a caller that finds it absent falls back to one call —
- * and so one flush — per request.
+ * {@link applyInOneGroup} is the one member that is OPTIONAL rather than merely unknown to a plain
+ * `IRepo`, since a test double cannot ignore a method it has to be called on. Nothing calls it
+ * directly: every apply loop goes through {@link applyAsOneGroup}, the one place the absent case is
+ * written.
  */
 export interface ILocalApply {
 	pend(request: PendRequest, options?: MessageOptions, apply?: StorageApplyOptions): Promise<PendResult>;
@@ -347,6 +348,29 @@ export interface LocalApplyGroup {
 	pend(request: PendRequest, options?: MessageOptions): Promise<PendResult>;
 	/** `options` is accepted for symmetry with {@link ILocalApply.commit} and, like it, read by nothing: a commit takes no fact about its writer. */
 	commit(request: CommitRequest, options?: MessageOptions, proof?: BlockCommitProof): Promise<CommitResult>;
+}
+
+/**
+ * Run `body` as one storage write group — the only way the apply loops reach
+ * {@link ILocalApply.applyInOneGroup}. `storage` offering no group is the plain-`IRepo` case (every
+ * test double that stands in for a store); `body` then runs against a handle that forwards each
+ * request straight to `storage.pend` / `storage.commit` with `apply`, so each one flushes on its own
+ * as it did before groups existed. The point is that `body` is written once: a caller that branched
+ * on the probe itself would state the loop twice, and the two statements of it — one per apply
+ * path — could drift apart in any of the five loops that need one.
+ */
+export async function applyAsOneGroup<T>(
+	storage: ILocalApply, apply: StorageApplyOptions | undefined, body: (group: LocalApplyGroup) => Promise<T>
+): Promise<T> {
+	if (storage.applyInOneGroup !== undefined) {
+		return await storage.applyInOneGroup(apply ?? {}, body);
+	}
+	return await body({
+		pend: (request, options) => storage.pend(request, options, apply),
+		// A commit's proof belongs to the request, not to the group, so it is folded back into the
+		// per-call options here — the shape `ILocalApply.commit` takes.
+		commit: (request, options, proof) => storage.commit(request, options, proof === undefined ? apply : { ...apply, proof })
+	});
 }
 
 /**
@@ -1670,11 +1694,14 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 * must not start paying for a sync now that it is a group of one.
 	 *
 	 * The change hold ({@link emitCollectionChanges}) sees a batch rather than a sequence: every
-	 * collection of a batched commit has landed by the time the first emission runs, so each one's
-	 * hold finds the action's other groups already closed and releases at once — the same wakes as
-	 * before, with no hold. A batched pend notes its groups after the flush instead of after each
-	 * request, which is still before any commit of the action can reach this node (the commit record
-	 * follows the pend record's answer).
+	 * collection of a batched commit has landed by the time the first emission runs, so that emission
+	 * reads the record's other pend groups once ({@link closeAbandonedGroups}, one unlatched read per
+	 * block until a pending record is found), finds none of them still pending, and closes them all —
+	 * so nothing is held and every collection's event fires in its own emission. Fewer reads than the
+	 * sequence it replaces, where each emission in turn found the next collection genuinely pending
+	 * and held its event until the last one landed. A batched pend notes its groups after the flush
+	 * instead of after each request, which is still before any commit of the action can reach this
+	 * node (the commit record follows the pend record's answer).
 	 */
 	async applyInOneGroup<T>(apply: Pick<StorageApplyOptions, 'syncWithinMs'>, body: (group: LocalApplyGroup) => Promise<T>): Promise<T> {
 		const state: ApplyGroupState = { wrote: false, afterFlush: [] };

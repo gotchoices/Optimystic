@@ -13,7 +13,7 @@ import { quorumSize, corroboratorCapacity, selectQuorumRev, certifiedEquivocatio
 import { certifyClaim, isAttributableProofFailure, proofThresholds, type ProofAnchoring } from "../cluster/certified-claims.js";
 import { settleSoloAhead, type BlockLineageAsk } from "../cluster/solo-ahead.js";
 import { DEFAULT_CLUSTER_SIZE, reconcilePassTimeoutMs, resolveCohortQueryTimeoutMs, resolveReadRepairCoalesceMs, resolveReadRepairQuietWindowMs, resolveRepairCorroborationClusterSize } from "../cluster/cluster-policy.js";
-import { isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_REVISION_REASON, SOLO_COMMIT_REFUSED_REASON, type ILocalApply, type IRevisionActionReader, type IPendingClaimReader, type StorageApplyOptions } from "../storage/storage-repo.js";
+import { applyAsOneGroup, isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_REVISION_REASON, SOLO_COMMIT_REFUSED_REASON, type ILocalApply, type IRevisionActionReader, type IPendingClaimReader, type StorageApplyOptions } from "../storage/storage-repo.js";
 import { recordDurabilityWindowMs, type DurabilityWindowFor } from "../storage/durability-window.js";
 import { isReservationAgainst, isAbandonedClaim, hasLapsed, reservationRequestFor, cohortCanMissAPend, type PendingClaim } from "../storage/pending-claim.js";
 import { buildBlockCommitProof, type BlockCommitProof } from "../cluster/commit-proof.js";
@@ -3311,29 +3311,20 @@ export class CoordinatorRepo implements IRepo {
 	 * the earlier requests' pending records in place on purpose: the writer answered with a refused pend
 	 * cancels the whole action (`NetworkTransactor.pend`), so cancelling here would only duplicate that.
 	 *
-	 * The whole loop runs inside ONE storage write group where storage offers one
-	 * (`ILocalApply.applyInOneGroup`), so a record covering several collections costs one flush rather
-	 * than one per collection; the loop's own control flow is unchanged either way. A plain `IRepo`
-	 * test double has no group, and then each request flushes on its own as before.
+	 * The whole loop runs inside ONE storage write group ({@link applyAsOneGroup}), so a record
+	 * covering several collections costs one flush rather than one per collection; the loop's own
+	 * control flow is unchanged either way.
 	 */
 	private async applyPendsInOrder(batch: PendBatch, options?: MessageOptions, apply?: StorageApplyOptions): Promise<PendResult> {
-		const storage = this.localApply();
-		if (storage.applyInOneGroup === undefined) {
-			return await this.pendEachInOrder(request => storage.pend(request, options, apply), batch);
-		}
-		return await storage.applyInOneGroup(apply ?? {}, group =>
-			this.pendEachInOrder(request => group.pend(request, options), batch));
-	}
-
-	/** {@link applyPendsInOrder}'s loop, over a lone `pend` or a group's. */
-	private async pendEachInOrder(apply: (request: PendRequest) => Promise<PendResult>, batch: PendBatch): Promise<PendResult> {
-		const results: PendResult[] = [];
-		for (const request of batch.requests) {
-			const result = await apply(request);
-			results.push(result);
-			if (!result.success) break;
-		}
-		return foldPendResults(results);
+		return await applyAsOneGroup(this.localApply(), apply, async group => {
+			const results: PendResult[] = [];
+			for (const request of batch.requests) {
+				const result = await group.pend(request, options);
+				results.push(result);
+				if (!result.success) break;
+			}
+			return foldPendResults(results);
+		});
 	}
 
 	/**
@@ -4143,44 +4134,34 @@ export class CoordinatorRepo implements IRepo {
 		batch: CommitBatch, record: ClusterRecord, options?: MessageOptions
 	): Promise<{ held: CommitSuccess } | { diverged: string } | { refused: WriteFailure }> {
 		const apply: StorageApplyOptions = { proof: buildBlockCommitProof(record), syncWithinMs: this.syncWindowFor(record) };
-		const storage = this.localApply();
-		// One write group for the record's collections where storage offers one, as in
-		// `applyCommitsInOrder`. A tolerated divergence is a `continue` inside the body, not a throw,
-		// so the group still flushes and emits for the collections that did land.
-		if (storage.applyInOneGroup === undefined) {
-			return await this.commitEachAfterConsensus(request => storage.commit(request, options, apply), batch, record);
-		}
-		return await storage.applyInOneGroup(apply, group =>
-			this.commitEachAfterConsensus(request => group.commit(request, options, apply.proof), batch, record));
-	}
-
-	/** {@link applyCommitsAfterConsensus}'s loop, over a lone `commit` or a group's. */
-	private async commitEachAfterConsensus(
-		apply: (request: CommitRequest) => Promise<CommitResult>, batch: CommitBatch, record: ClusterRecord
-	): Promise<{ held: CommitSuccess } | { diverged: string } | { refused: WriteFailure }> {
-		const consensusReached = clusterReachedCommitConsensus(record);
-		const held: CommitResult[] = [];
-		let diverged: string | undefined;
-		for (const request of batch.requests) {
-			let result: CommitResult;
-			try {
-				result = await apply(request);
-			} catch (err) {
-				if (!consensusReached) throw err;
-				diverged ??= (err as Error).message;
-				continue;
+		// One write group for the record's collections, as in `applyCommitsInOrder`. A tolerated
+		// divergence is a `continue` inside the body, not a throw, so the group still flushes and emits
+		// for the collections that did land.
+		return await applyAsOneGroup(this.localApply(), apply, async group => {
+			const consensusReached = clusterReachedCommitConsensus(record);
+			const held: CommitResult[] = [];
+			let diverged: string | undefined;
+			for (const request of batch.requests) {
+				let result: CommitResult;
+				try {
+					result = await group.commit(request, options, apply.proof);
+				} catch (err) {
+					if (!consensusReached) throw err;
+					diverged ??= (err as Error).message;
+					continue;
+				}
+				if (result.success) {
+					held.push(result);
+				} else if (isMissingBaseRevisionFailure(result) && consensusReached) {
+					diverged ??= result.reason ?? MISSING_BASE_REVISION_REASON;
+				} else {
+					return { refused: result };
+				}
 			}
-			if (result.success) {
-				held.push(result);
-			} else if (isMissingBaseRevisionFailure(result) && consensusReached) {
-				diverged ??= result.reason ?? MISSING_BASE_REVISION_REASON;
-			} else {
-				return { refused: result };
-			}
-		}
-		if (diverged !== undefined) return { diverged };
-		const folded = foldCommitResults(held);
-		return folded.success ? { held: folded } : { refused: folded };
+			if (diverged !== undefined) return { diverged };
+			const folded = foldCommitResults(held);
+			return folded.success ? { held: folded } : { refused: folded };
+		});
 	}
 
 	/**
@@ -4458,28 +4439,19 @@ export class CoordinatorRepo implements IRepo {
 	 * the earlier requests committed: they are this action's own revisions, which a retry of the action
 	 * meets as already done (`isOwnRevision`).
 	 *
-	 * One storage write group for the whole loop where storage offers one, exactly as
-	 * {@link applyPendsInOrder}: the record's collections share a flush, and their change events fire
-	 * after it.
+	 * One storage write group for the whole loop, exactly as {@link applyPendsInOrder}: the record's
+	 * collections share a flush, and their change events fire after it.
 	 */
 	private async applyCommitsInOrder(batch: CommitBatch, options: MessageOptions | undefined, apply: StorageApplyOptions): Promise<CommitResult> {
-		const storage = this.localApply();
-		if (storage.applyInOneGroup === undefined) {
-			return await this.commitEachInOrder(request => storage.commit(request, options, apply), batch);
-		}
-		return await storage.applyInOneGroup(apply, group =>
-			this.commitEachInOrder(request => group.commit(request, options, apply.proof), batch));
-	}
-
-	/** {@link applyCommitsInOrder}'s loop, over a lone `commit` or a group's. */
-	private async commitEachInOrder(apply: (request: CommitRequest) => Promise<CommitResult>, batch: CommitBatch): Promise<CommitResult> {
-		const results: CommitResult[] = [];
-		for (const request of batch.requests) {
-			const result = await apply(request);
-			results.push(result);
-			if (!result.success) break;
-		}
-		return foldCommitResults(results);
+		return await applyAsOneGroup(this.localApply(), apply, async group => {
+			const results: CommitResult[] = [];
+			for (const request of batch.requests) {
+				const result = await group.commit(request, options, apply.proof);
+				results.push(result);
+				if (!result.success) break;
+			}
+			return foldCommitResults(results);
+		});
 	}
 
 	/**

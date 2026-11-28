@@ -29,6 +29,7 @@
 import { expect } from 'chai';
 import { Tree, TornActionError, emptyTransforms, type ActionId, type BlockLineage, type ITransactor, type CommitRequest, type CommitResult } from '@optimystic/db-core';
 import { createMesh, buildNetworkTransactors, type Mesh, type MeshNode } from '../src/testing/mesh-harness.js';
+import { interceptCommits } from './support/intercept-commits.js';
 
 interface Row {
 	key: string;
@@ -129,20 +130,18 @@ const readingFrom = (node: MeshNode, inner: ITransactor): ITransactor => {
  */
 const missTheNextDataCommit = (node: MeshNode): { missed: () => number } => {
 	let missed = 0;
-	const storage = node.storageRepo;
-	const apply = storage.commit.bind(storage);
-	storage.commit = async (request, options, proof) => {
+	interceptCommits(node, async (request, through) => {
 		const carriesTail = request.tailId !== undefined && request.blockIds.includes(request.tailId);
 		if (missed === 0 && request.blockIds.some(id => id !== request.tailId)) {
 			missed++;
 			if (carriesTail) {
-				const tail = await apply({ ...request, blockIds: [request.tailId!] }, options, proof);
+				const tail = await through({ ...request, blockIds: [request.tailId!] });
 				if (!tail.success) return tail;
 			}
 			return { success: false, missing: [{ actionId: 'never-applied' as ActionId, rev: request.rev, transforms: emptyTransforms() }] };
 		}
-		return apply(request, options, proof);
-	};
+		return await through(request);
+	});
 	return { missed: () => missed };
 };
 

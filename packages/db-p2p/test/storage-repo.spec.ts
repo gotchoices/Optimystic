@@ -4140,8 +4140,9 @@ describe('StorageRepo — every write group ends with one flush (storage.md Inva
 				expect((await group.commit(batchCommit(blockId))).success).to.equal(true);
 			}
 		});
-		// Every collection has landed by the time the first event fires, so each one's change hold
-		// finds the action's other pend groups already closed and releases at once.
+		// Every collection has landed by the time the first event fires, so the change hold finds no
+		// pend group of the action still pending and holds nothing: each event fires in its own
+		// emission, in request order.
 		expect(trace, 'one flush for the record, every collection announced after it')
 			.to.deep.equal(['flush', 'event:block-a', 'event:block-b', 'event:block-c']);
 	});

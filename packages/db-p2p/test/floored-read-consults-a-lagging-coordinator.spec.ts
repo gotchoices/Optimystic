@@ -22,6 +22,7 @@ import { expect } from 'chai';
 import { Tree, emptyTransforms, isFullyDurable, type ActionId, type CommitRequest, type ITransactor, type WriteDurability } from '@optimystic/db-core';
 import { createMesh, buildNetworkTransactors, type MeshNode } from '../src/testing/mesh-harness.js';
 import { captureLog } from './support/capture-log.js';
+import { interceptCommits } from './support/intercept-commits.js';
 
 interface Row {
 	key: string;
@@ -72,13 +73,11 @@ const readingThroughCoordinator = (node: MeshNode, inner: ITransactor): ITransac
  */
 const missTheNextCommit = (node: MeshNode): { missed: () => CommitRequest | undefined } => {
 	let missed: CommitRequest | undefined;
-	const storage = node.storageRepo;
-	const apply = storage.commit.bind(storage);
-	storage.commit = async (request, options, proof) => {
-		if (missed !== undefined) return apply(request, options, proof);
+	interceptCommits(node, async (request, through) => {
+		if (missed !== undefined) return await through(request);
 		missed = request;
 		return { success: false, missing: [{ actionId: 'never-applied' as ActionId, rev: request.rev, transforms: emptyTransforms() }] };
-	};
+	});
 	return { missed: () => missed };
 };
 

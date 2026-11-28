@@ -12,17 +12,30 @@
  *
  * To make the gap deterministic rather than a race, node 1's apply of the index's commit is made to lag
  * its apply of the table's: node 1's storage holds every commit of the index's log tail on a gate that
- * node 1's wake handler releases after it has run its lookups (or a fallback delay, since with the hold
- * in place the handler does not run until the index lands). The gate sits at storage rather than on the
- * cluster delivery because a batched record delivers both commits at once. The second case runs the
- * same scenario with the hold disabled and observes the gap, so the first case cannot pass for want of
- * the race it is meant to close.
+ * node 1's wake handler releases after it has run its lookups, or a fallback delay when the handler
+ * does not run before the index lands. The gate sits at storage rather than on the cluster delivery
+ * because a batched record delivers both commits at once, and it covers BOTH storage seams — the
+ * public `commit` and the write group a member applies a record's commits inside — since a gate on
+ * `commit` alone is one a batched apply walks straight past.
+ *
+ * The second case runs the same scenario with the hold disabled. On this mesh the table and the index
+ * travel in ONE consensus record, which node 1 applies inside one storage write group: neither event
+ * fires until the group's single flush, by which time both have landed. So the wake sees both with the
+ * hold or without it, and that is what the control pins — it fails if a record's collections ever go
+ * back to a flush and an emission each.
+ *
+ * NOTE: no case here reproduces #47's original race any more. That race needs the table's event to
+ * fire while the index is still unlanded, and a one-record action cannot do it. The hold still closes
+ * the race where an action's collections travel as SEPARATE records, and that shape is pinned at the
+ * storage tier (`packages/db-p2p/test/action-change-hold.spec.ts`, and the hold cases in
+ * `packages/db-p2p/test/storage-repo.spec.ts`) rather than here. To reproduce the race end to end
+ * again, this scenario would have to make the table and the index land in different records.
  */
 
 import { expect } from 'chai';
 import { defaultCollectionUri } from '../dist/index.js';
 import type { Database, SqlValue } from '@quereus/quereus';
-import { Collection, type CollectionId } from '@optimystic/db-core';
+import { Collection, type CollectionId, type CommitRequest } from '@optimystic/db-core';
 import { waitFor } from '@optimystic/db-core/test';
 import { collectionIdOf } from './trace-helpers.js';
 import { createMeshDbNode, startMockMesh, type MockMeshOptions } from './mesh-node-harness.js';
@@ -37,10 +50,12 @@ const INDEX_COLLECTION_ID = collectionIdOf(INDEX_URI) as CollectionId;
 const createTableSql = `create table T (Id integer primary key, K text) using optimystic('${TABLE_URI}')`;
 const createIndexSql = `create index TByK on T (K)`;
 
-/** How long node 1's apply of the index's commit lags the table's when nothing releases it sooner — well over an in-process wake handler's run. */
+/**
+ * How long node 1's apply of the index's commit lags the table's before the gate releases itself.
+ * Well over an in-process wake handler's run — and for a one-record action it is always what
+ * releases, since the handler cannot run until the whole group has landed and flushed.
+ */
 const INDEX_LAG_FALLBACK_MS = 400;
-/** The control's fallback is a safety net only: there the wake handler always runs and releases the gate itself. */
-const CONTROL_FALLBACK_MS = 10_000;
 
 async function collect(db: Database, sql: string): Promise<Row[]> {
 	const rows: Row[] = [];
@@ -101,12 +116,26 @@ async function scenario(meshOptions: MockMeshOptions, indexLagFallbackMs: number
 	let indexLag: ReturnType<typeof gate> | undefined;
 	const watcherStorage = mesh.nodes[1]!.storageRepo;
 	const applyCommit = watcherStorage.commit.bind(watcherStorage);
-	watcherStorage.commit = async (request, options, apply) => {
+	const applyInOneGroup = watcherStorage.applyInOneGroup.bind(watcherStorage);
+	const lagTheIndex = async (request: CommitRequest): Promise<void> => {
 		if (indexLag !== undefined && request.tailId === indexTail!.tailId) {
 			await indexLag.promise;
 		}
+	};
+	watcherStorage.commit = async (request, options, apply) => {
+		await lagTheIndex(request);
 		return await applyCommit(request, options, apply);
 	};
+	// A cohort member applies a consensus record's commits inside ONE storage write group, whose
+	// handle writes under each request's latches without going through `commit` — so the gate has to
+	// cover the group too, or node 1 applies the index's commit at once and the lag never happens.
+	watcherStorage.applyInOneGroup = (apply, body) => applyInOneGroup(apply, group => body({
+		pend: group.pend,
+		commit: async (request, options, proof) => {
+			await lagTheIndex(request);
+			return await group.commit(request, options, proof);
+		}
+	}));
 
 	const wakes: Wake[] = [];
 	const subscription = watcher.db.watch(watcher.db.prepare('select Id, K from T').getChangeScope(), async () => {
@@ -130,6 +159,7 @@ async function scenario(meshOptions: MockMeshOptions, indexLagFallbackMs: number
 		async close(): Promise<void> {
 			subscription.unsubscribe();
 			watcherStorage.commit = applyCommit;
+			watcherStorage.applyInOneGroup = applyInOneGroup;
 			await watcher.db.close();
 			await writer.db.close();
 		}
@@ -158,12 +188,14 @@ describe('Two-node watch wake sees the table and its index together (GitHub #47)
 		}
 	});
 
-	it('control: with the hold disabled, the wake that finds the row by primary key misses it through the index', async () => {
-		const run = await scenario({ changeHoldMs: 0 }, CONTROL_FALLBACK_MS);
+	it('control: with the hold disabled, the record\'s one write group still lands the index before the wake', async () => {
+		const run = await scenario({ changeHoldMs: 0 }, INDEX_LAG_FALLBACK_MS);
 		try {
 			await run.insert(1);
 			expect(run.wakes.some(wake => wake.id === 1 && wake.byPrimaryKey && !wake.byIndex),
-				`without the hold the table's event wakes node 1 before the index lands there; wakes: ${JSON.stringify(run.wakes)}`).to.equal(true);
+				`no wake may find the row by primary key alone; wakes: ${JSON.stringify(run.wakes)}`).to.equal(false);
+			expect(run.wakes.some(wake => wake.id === 1 && wake.byIndex),
+				`the wake finds the row through the index; wakes: ${JSON.stringify(run.wakes)}`).to.equal(true);
 		} finally {
 			await run.close();
 		}
