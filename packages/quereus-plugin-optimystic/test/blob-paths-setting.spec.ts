@@ -5,9 +5,11 @@
  *
  * Two things earn a case here. The PARSER, because a host that asked for path access and got
  * `undefined` back cannot otherwise tell a mistyped mode from a store that cannot reach files, so
- * every branch of the refusal is a promise. And that the mode actually REACHES the single-machine
- * blob service every transactor without a libp2p node gets — the plugin→db-p2p seam no type
- * settles, and the configuration (a phone on local storage, no mesh) the setting most exists for.
+ * every branch of the refusal is a promise. And the WHOLE chain a host actually registers through —
+ * `register(db, { blob_paths })` to `plugin.blobs.pathAccess()` — because every link in it carries
+ * the mode in an OPTIONAL field (`ParsedOptimysticOptions.blobPaths`), so a link that stopped
+ * carrying it would still compile; that, and not the single-machine service's own handling of
+ * `paths`, is what no type settles.
  *
  * The forwarding into `createLibp2pNode` is one literal field the node's own option type settles,
  * and a path put's pin rules are `put`'s own shared code (`SqlBlobService.pinnedPut`); neither is
@@ -17,9 +19,11 @@
 import { expect } from 'chai';
 import { MemoryKVStore, MemoryPieceStore, MemoryRawStorage, type NodeStorage } from '@optimystic/db-p2p';
 import { Database } from '@quereus/quereus';
+import type { SqlValue } from '@quereus/quereus';
 import register from '../dist/plugin.js';
 import { declaredBlobPaths } from '../src/optimystic-module.js';
-import type { ParsedOptimysticTreeOptions as ParsedOptimysticOptions } from '../dist/index.js';
+
+type Plugin = ReturnType<typeof register>;
 
 describe('declaredBlobPaths: the path mode the plugin hands its blob services', () => {
 	it('declares nothing when the setting is unset, null, or the empty string a settings form sends', () => {
@@ -44,7 +48,7 @@ describe('declaredBlobPaths: the path mode the plugin hands its blob services', 
 
 /**
  * A piece store that can reach files, as far as the blob service's duck-type check cares
- * (`offersFiles` asks only that both calls are functions), so a spec can see a path mode become
+ * (`offersFiles` asks only that both calls are functions), so a spec can see a registration become
  * path access without a filesystem.
  */
 class FileCapableMemoryPieceStore extends MemoryPieceStore {
@@ -57,41 +61,48 @@ class FileCapableMemoryPieceStore extends MemoryPieceStore {
 	}
 }
 
-describe('blob_paths reaches the single-machine blob service', function () {
+describe('blob_paths registered turns on path access in SQL', function () {
 	this.timeout(5000);
+
+	const open: { db: Database; plugin: Plugin }[] = [];
+
+	afterEach(async () => {
+		for (const { db, plugin } of open.splice(0)) {
+			db.close();
+			await plugin.dispose();
+		}
+	});
 
 	function storageWithFileCapablePieces(): NodeStorage {
 		return { blocks: new MemoryRawStorage(), kv: new MemoryKVStore(), pieces: new FileCapableMemoryPieceStore() };
 	}
 
-	function optionsFor(blobPaths: ParsedOptimysticOptions['blobPaths']): ParsedOptimysticOptions {
-		return {
-			collectionUri: 'tree://local-test/widgets',
-			transactor: 'local',
-			keyNetwork: 'test',
-			libp2pOptions: {},
-			cache: false,
-			encoding: 'json',
-			storageFactory: storageWithFileCapablePieces,
-			blobPaths,
-		};
-	}
-
-	function blobFactory() {
-		return register(new Database(), {
+	/**
+	 * A plugin registered as a host registers one — on a `local` transactor, so its blobs go through
+	 * the single-machine service rather than a node, over a piece store that can reach files.
+	 * `blob_paths` is left out of the config entirely when `blobPaths` is undefined, which is the
+	 * unset case as a host writes it.
+	 */
+	function pluginWith(blobPaths?: string): Plugin {
+		const db = new Database();
+		const plugin = register(db, {
 			default_transactor: 'local',
 			default_key_network: 'test',
 			enable_cache: false,
-		}).collectionFactory;
+			storageFactory: storageWithFileCapablePieces,
+			...(blobPaths === undefined ? {} : { blob_paths: blobPaths }),
+		} as unknown as Record<string, SqlValue>);
+		for (const vtable of plugin.vtables) db.registerModule(vtable.name, vtable.module, vtable.auxData);
+		open.push({ db, plugin });
+		return plugin;
 	}
 
 	it('offers path access in the declared mode over a store that can reach files', async () => {
-		const backend = await blobFactory().getBlobBackend(optionsFor('verify'));
-		expect(backend.service.paths?.mode).to.equal('verify');
+		const paths = await pluginWith('verify').blobs.pathAccess();
+		expect(paths?.mode).to.equal('verify');
 	});
 
 	it('offers none when the setting is unset', async () => {
-		const backend = await blobFactory().getBlobBackend(optionsFor(undefined));
-		expect(backend.service.paths).to.equal(undefined);
+		expect(await pluginWith().blobs.pathAccess()).to.equal(undefined);
 	});
 });

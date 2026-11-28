@@ -690,7 +690,15 @@ function resolveBinding(
   };
 }
 
-/** The three modes `blob_paths` accepts, as the setting and its error message list them. */
+/**
+ * The three modes `blob_paths` accepts, as the setting and its error message list them.
+ *
+ * NOTE: this IS the accepted set, as {@link STORAGE_ALLOTMENT_KEYS} is for that setting and for the
+ * same reason — `satisfies` catches a RENAME of a mode over in db-p2p as a compile error here, but
+ * a mode ADDED there is refused by this plugin (and absent from `package.json`'s `quereus.settings`
+ * and the README's table) until it is added to this list. If a fourth mode is ever added, those are
+ * the three places it has to reach.
+ */
 const BLOB_PATH_MODES = ['off', 'verify', 'trust'] satisfies BlobPathMode[];
 
 /**
