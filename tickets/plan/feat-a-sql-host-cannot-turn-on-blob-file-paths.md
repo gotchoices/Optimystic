@@ -5,6 +5,8 @@ difficulty: easy
 tradeoffs: The one host this was built for (Sereus Chat, GitHub #69) builds its own libp2p node and registers it, which already works — so this closes a hole nobody is standing in yet, and adding a registration option means one more setting to validate, document and keep in agreement with the node option it forwards to.
 ----
 
+Pulled from backlog 2026-11-27 while tending: it finishes the blobs-by-file-path feature (GitHub #69) in the same release, and needs no design decision beyond naming the option.
+
 # A SQL host cannot turn on blob file paths
 
 ## What a host can do today
